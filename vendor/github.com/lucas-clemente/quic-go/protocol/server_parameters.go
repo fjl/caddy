@@ -12,22 +12,31 @@ const InitialCongestionWindow = 32
 // session queues for later until it sends a public reset.
 const MaxUndecryptablePackets = 10
 
-// AckSendDelay is the maximal time delay applied to packets containing only ACKs
-const AckSendDelay = 5 * time.Millisecond
+// AckSendDelay is the maximum delay that can be applied to an ACK for a retransmittable packet
+// This is the value Chromium is using
+const AckSendDelay = 25 * time.Millisecond
 
 // ReceiveStreamFlowControlWindow is the stream-level flow control window for receiving data
 // This is the value that Google servers are using
-const ReceiveStreamFlowControlWindow ByteCount = (1 << 20) // 1 MB
+const ReceiveStreamFlowControlWindow ByteCount = (1 << 10) * 32 // 32 kB
 
-// ReceiveConnectionFlowControlWindow is the stream-level flow control window for receiving data
+// ReceiveConnectionFlowControlWindow is the connection-level flow control window for receiving data
 // This is the value that Google servers are using
-const ReceiveConnectionFlowControlWindow ByteCount = (1 << 20) * 1.5 // 1.5 MB
+const ReceiveConnectionFlowControlWindow ByteCount = (1 << 10) * 48 // 48 kB
+
+// MaxReceiveStreamFlowControlWindow is the maximum stream-level flow control window for receiving data
+// This is the value that Google servers are using
+const MaxReceiveStreamFlowControlWindow ByteCount = 1 * (1 << 20) // 1 MB
+
+// MaxReceiveConnectionFlowControlWindow is the connection-level flow control window for receiving data
+// This is the value that Google servers are using
+const MaxReceiveConnectionFlowControlWindow ByteCount = 1.5 * (1 << 20) // 1.5 MB
 
 // MaxStreamsPerConnection is the maximum value accepted for the number of streams per connection
 const MaxStreamsPerConnection = 100
 
-// MaxIncomingDynamicStreams is the maximum value accepted for the incoming number of dynamic streams per connection
-const MaxIncomingDynamicStreams = 100
+// MaxIncomingDynamicStreamsPerConnection is the maximum value accepted for the incoming number of dynamic streams per connection
+const MaxIncomingDynamicStreamsPerConnection = 100
 
 // MaxStreamsMultiplier is the slack the client is allowed for the maximum number of streams per connection, needed e.g. when packets are out of order or dropped. The minimum of this procentual increase and the absolute increment specified by MaxStreamsMinimumIncrement is used.
 const MaxStreamsMultiplier = 1.1
@@ -63,6 +72,12 @@ const MaxTrackedReceivedPackets = 2 * DefaultMaxCongestionWindow
 // MaxTrackedReceivedAckRanges is the maximum number of ACK ranges tracked
 const MaxTrackedReceivedAckRanges = DefaultMaxCongestionWindow
 
+// MaxPacketsReceivedBeforeAckSend is the number of packets that can be received before an ACK frame is sent
+const MaxPacketsReceivedBeforeAckSend = 20
+
+// RetransmittablePacketsBeforeAck is the number of retransmittable that an ACK is sent for
+const RetransmittablePacketsBeforeAck = 2
+
 // MaxStreamFrameSorterGaps is the maximum number of gaps between received StreamFrames
 // prevents DoS attacks against the streamFrameSorter
 const MaxStreamFrameSorterGaps = 1000
@@ -88,6 +103,10 @@ const MaxIdleTimeout = 1 * time.Minute
 
 // MaxTimeForCryptoHandshake is the default timeout for a connection until the crypto handshake succeeds.
 const MaxTimeForCryptoHandshake = 10 * time.Second
+
+// ClosedSessionDeleteTimeout the server ignores packets arriving on a connection that is already closed
+// after this time all information about the old connection will be deleted
+const ClosedSessionDeleteTimeout = time.Minute
 
 // NumCachedCertificates is the number of cached compressed certificate chains, each taking ~1K space
 const NumCachedCertificates = 128

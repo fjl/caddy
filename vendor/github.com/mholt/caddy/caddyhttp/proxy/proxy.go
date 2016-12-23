@@ -94,6 +94,15 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	// outreq is the request that makes a roundtrip to the backend
 	outreq := createUpstreamRequest(r)
 
+	// record and replace outreq body
+	body, err := newBufferedBody(outreq.Body)
+	if err != nil {
+		return http.StatusBadRequest, errors.New("failed to read downstream request body")
+	}
+	if body != nil {
+		outreq.Body = body
+	}
+
 	// The keepRetrying function will return true if we should
 	// loop and try to select another host, or false if we
 	// should break and stop retrying.
@@ -164,6 +173,11 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 			downHeaderUpdateFn = createRespHeaderUpdateFn(host.DownstreamHeaders, replacer)
 		}
 
+		// rewind request body to its beginning
+		if err := body.rewind(); err != nil {
+			return http.StatusInternalServerError, errors.New("unable to rewind downstream request body")
+		}
+
 		// tell the proxy to serve the request
 		atomic.AddInt64(&host.Conns, 1)
 		backendErr = proxy.ServeHTTP(w, outreq, downHeaderUpdateFn)
@@ -172,6 +186,10 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 		// if no errors, we're done here
 		if backendErr == nil {
 			return 0, nil
+		}
+
+		if _, ok := backendErr.(httpserver.MaxBytesExceeded); ok {
+			return http.StatusRequestEntityTooLarge, backendErr
 		}
 
 		// failover; remember this failure for some time if
@@ -229,12 +247,28 @@ func createUpstreamRequest(r *http.Request) *http.Request {
 		outreq.URL.Opaque = outreq.URL.RawPath
 	}
 
+	// We are modifying the same underlying map from req (shallow
+	// copied above) so we only copy it if necessary.
+	copiedHeaders := false
+
+	// Remove hop-by-hop headers listed in the "Connection" header.
+	// See RFC 2616, section 14.10.
+	if c := outreq.Header.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				if !copiedHeaders {
+					outreq.Header = make(http.Header)
+					copyHeader(outreq.Header, r.Header)
+					copiedHeaders = true
+				}
+				outreq.Header.Del(f)
+			}
+		}
+	}
+
 	// Remove hop-by-hop headers to the backend. Especially
 	// important is "Connection" because we want a persistent
-	// connection, regardless of what the client sent to us. This
-	// is modifying the same underlying map from r (shallow
-	// copied above) so we only copy it if necessary.
-	var copiedHeaders bool
+	// connection, regardless of what the client sent to us.
 	for _, h := range hopHeaders {
 		if outreq.Header.Get(h) != "" {
 			if !copiedHeaders {
@@ -269,12 +303,18 @@ func mutateHeadersByRules(headers, rules http.Header, repl httpserver.Replacer) 
 	for ruleField, ruleValues := range rules {
 		if strings.HasPrefix(ruleField, "+") {
 			for _, ruleValue := range ruleValues {
-				headers.Add(strings.TrimPrefix(ruleField, "+"), repl.Replace(ruleValue))
+				replacement := repl.Replace(ruleValue)
+				if len(replacement) > 0 {
+					headers.Add(strings.TrimPrefix(ruleField, "+"), replacement)
+				}
 			}
 		} else if strings.HasPrefix(ruleField, "-") {
 			headers.Del(strings.TrimPrefix(ruleField, "-"))
 		} else if len(ruleValues) > 0 {
-			headers.Set(ruleField, repl.Replace(ruleValues[len(ruleValues)-1]))
+			replacement := repl.Replace(ruleValues[len(ruleValues)-1])
+			if len(replacement) > 0 {
+				headers.Set(ruleField, replacement)
+			}
 		}
 	}
 }

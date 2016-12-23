@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !go1.8
-
 package imports
 
 import (
@@ -462,6 +460,9 @@ func shouldTraverse(dir string, fi os.FileInfo) bool {
 		return false
 	}
 	if !ts.IsDir() {
+		return false
+	}
+	if skipDir(ts) {
 		return false
 	}
 

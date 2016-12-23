@@ -3,6 +3,7 @@ package handshake
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
@@ -38,7 +39,7 @@ type CryptoSetup struct {
 
 	cryptoStream utils.Stream
 
-	connectionParametersManager *ConnectionParametersManager
+	connectionParameters ConnectionParametersManager
 
 	mutex sync.RWMutex
 }
@@ -52,19 +53,19 @@ func NewCryptoSetup(
 	version protocol.VersionNumber,
 	scfg *ServerConfig,
 	cryptoStream utils.Stream,
-	connectionParametersManager *ConnectionParametersManager,
+	connectionParameters ConnectionParametersManager,
 	aeadChanged chan struct{},
 ) (*CryptoSetup, error) {
 	return &CryptoSetup{
-		connID:                      connID,
-		ip:                          ip,
-		version:                     version,
-		scfg:                        scfg,
-		keyDerivation:               crypto.DeriveKeysAESGCM,
-		keyExchange:                 getEphermalKEX,
-		cryptoStream:                cryptoStream,
-		connectionParametersManager: connectionParametersManager,
-		aeadChanged:                 aeadChanged,
+		connID:               connID,
+		ip:                   ip,
+		version:              version,
+		scfg:                 scfg,
+		keyDerivation:        crypto.DeriveKeysAESGCM,
+		keyExchange:          getEphermalKEX,
+		cryptoStream:         cryptoStream,
+		connectionParameters: connectionParameters,
+		aeadChanged:          aeadChanged,
 	}, nil
 }
 
@@ -102,9 +103,31 @@ func (h *CryptoSetup) handleMessage(chloData []byte, cryptoData map[Tag][]byte) 
 		return false, qerr.Error(qerr.CryptoMessageParameterNotFound, "SNI required")
 	}
 
+	// prevent version downgrade attacks
+	// see https://groups.google.com/a/chromium.org/forum/#!topic/proto-quic/N-de9j63tCk for a discussion and examples
+	verSlice, ok := cryptoData[TagVER]
+	if !ok {
+		return false, qerr.Error(qerr.InvalidCryptoMessageParameter, "client hello missing version tag")
+	}
+	if len(verSlice) != 4 {
+		return false, qerr.Error(qerr.InvalidCryptoMessageParameter, "incorrect version tag")
+	}
+	verTag := binary.LittleEndian.Uint32(verSlice)
+	ver := protocol.VersionTagToNumber(verTag)
+	// If the client's preferred version is not the version we are currently speaking, then the client went through a version negotiation.  In this case, we need to make sure that we actually do not support this version and that it wasn't a downgrade attack.
+	if ver != h.version && protocol.IsSupportedVersion(ver) {
+		return false, qerr.Error(qerr.VersionNegotiationMismatch, "Downgrade attack detected")
+	}
+
 	var reply []byte
 	var err error
-	if !h.isInchoateCHLO(cryptoData) {
+
+	certUncompressed, err := h.scfg.signer.GetLeafCert(sni)
+	if err != nil {
+		return false, err
+	}
+
+	if !h.isInchoateCHLO(cryptoData, certUncompressed) {
 		// We have a CHLO with a proper server config ID, do a 0-RTT handshake
 		reply, err = h.handleCHLO(sni, chloData, cryptoData)
 		if err != nil {
@@ -168,12 +191,20 @@ func (h *CryptoSetup) Seal(dst, src []byte, packetNumber protocol.PacketNumber, 
 	}
 }
 
-func (h *CryptoSetup) isInchoateCHLO(cryptoData map[Tag][]byte) bool {
+func (h *CryptoSetup) isInchoateCHLO(cryptoData map[Tag][]byte, cert []byte) bool {
+	if _, ok := cryptoData[TagPUBS]; !ok {
+		return true
+	}
 	scid, ok := cryptoData[TagSCID]
 	if !ok || !bytes.Equal(h.scfg.ID, scid) {
 		return true
 	}
-	if _, ok := cryptoData[TagPUBS]; !ok {
+	xlctTag, ok := cryptoData[TagXLCT]
+	if !ok || len(xlctTag) != 8 {
+		return true
+	}
+	xlct := binary.LittleEndian.Uint64(xlctTag)
+	if crypto.HashCert(cert) != xlct {
 		return true
 	}
 	if err := h.scfg.stkSource.VerifyToken(h.ip, cryptoData[TagSTK]); err != nil {
@@ -219,6 +250,7 @@ func (h *CryptoSetup) handleInchoateCHLO(sni string, chlo []byte, cryptoData map
 
 	var serverReply bytes.Buffer
 	WriteHandshakeMessage(&serverReply, TagREJ, replyMap)
+	utils.Debugf("Sending REJ:\n%s", printHandshakeMessage(cryptoData))
 	return serverReply.Bytes(), nil
 }
 
@@ -237,8 +269,8 @@ func (h *CryptoSetup) handleCHLO(sni string, data []byte, cryptoData map[Tag][]b
 		return nil, err
 	}
 
-	nonce := make([]byte, 32)
-	if _, err = rand.Read(nonce); err != nil {
+	serverNonce := make([]byte, 32)
+	if _, err = rand.Read(serverNonce); err != nil {
 		return nil, err
 	}
 
@@ -247,10 +279,26 @@ func (h *CryptoSetup) handleCHLO(sni string, data []byte, cryptoData map[Tag][]b
 		return nil, err
 	}
 
+	clientNonce := cryptoData[TagNONC]
+	err = h.validateClientNonce(clientNonce)
+	if err != nil {
+		return nil, err
+	}
+
+	aead := cryptoData[TagAEAD]
+	if !bytes.Equal(aead, []byte("AESG")) {
+		return nil, qerr.Error(qerr.CryptoNoSupport, "Unsupported AEAD or KEXS")
+	}
+
+	kexs := cryptoData[TagKEXS]
+	if !bytes.Equal(kexs, []byte("C255")) {
+		return nil, qerr.Error(qerr.CryptoNoSupport, "Unsupported AEAD or KEXS")
+	}
+
 	h.secureAEAD, err = h.keyDerivation(
 		false,
 		sharedSecret,
-		cryptoData[TagNONC],
+		clientNonce,
 		h.connID,
 		data,
 		h.scfg.Get(),
@@ -263,13 +311,14 @@ func (h *CryptoSetup) handleCHLO(sni string, data []byte, cryptoData map[Tag][]b
 
 	// Generate a new curve instance to derive the forward secure key
 	var fsNonce bytes.Buffer
-	fsNonce.Write(cryptoData[TagNONC])
-	fsNonce.Write(nonce)
+	fsNonce.Write(clientNonce)
+	fsNonce.Write(serverNonce)
 	ephermalKex := h.keyExchange()
 	ephermalSharedSecret, err := ephermalKex.CalculateSharedKey(cryptoData[TagPUBS])
 	if err != nil {
 		return nil, err
 	}
+
 	h.forwardSecureAEAD, err = h.keyDerivation(
 		true,
 		ephermalSharedSecret,
@@ -284,19 +333,20 @@ func (h *CryptoSetup) handleCHLO(sni string, data []byte, cryptoData map[Tag][]b
 		return nil, err
 	}
 
-	err = h.connectionParametersManager.SetFromMap(cryptoData)
+	err = h.connectionParameters.SetFromMap(cryptoData)
 	if err != nil {
 		return nil, err
 	}
 
-	replyMap := h.connectionParametersManager.GetSHLOMap()
+	replyMap := h.connectionParameters.GetSHLOMap()
 	// add crypto parameters
 	replyMap[TagPUBS] = ephermalKex.PublicKey()
-	replyMap[TagSNO] = nonce
+	replyMap[TagSNO] = serverNonce
 	replyMap[TagVER] = protocol.SupportedVersionsAsTags
 
 	var reply bytes.Buffer
 	WriteHandshakeMessage(&reply, TagSHLO, replyMap)
+	utils.Debugf("Sending SHLO:\n%s", printHandshakeMessage(cryptoData))
 
 	h.aeadChanged <- struct{}{}
 
@@ -324,4 +374,14 @@ func (h *CryptoSetup) UnlockForSealing() {
 // HandshakeComplete returns true after the first forward secure packet was received form the client.
 func (h *CryptoSetup) HandshakeComplete() bool {
 	return h.receivedForwardSecurePacket
+}
+
+func (h *CryptoSetup) validateClientNonce(nonce []byte) error {
+	if len(nonce) != 32 {
+		return qerr.Error(qerr.InvalidCryptoMessageParameter, "invalid client nonce length")
+	}
+	if !bytes.Equal(nonce[4:12], h.scfg.obit) {
+		return qerr.Error(qerr.InvalidCryptoMessageParameter, "OBIT not matching")
+	}
+	return nil
 }
