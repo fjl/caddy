@@ -125,14 +125,14 @@ func (z *Lexer) read(pos int) byte {
 
 	// read in new data for the rest of the buffer
 	var n int
-	n, z.err = z.r.Read(buf[d:cap(buf)])
+	for pos-z.start >= d && z.err == nil {
+		n, z.err = z.r.Read(buf[d:cap(buf)])
+		d += n
+	}
 	pos -= z.start
 	z.pos -= z.start
-	z.start, z.buf = 0, buf[:d+n]
-	if pos >= d+n {
-		if z.err == nil {
-			z.err = io.EOF
-		}
+	z.start, z.buf = 0, buf[:d]
+	if pos >= d {
 		return 0
 	}
 	return z.buf[pos]
