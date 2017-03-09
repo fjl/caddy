@@ -14,6 +14,7 @@ import (
 
 	"os"
 
+	"github.com/mholt/caddy"
 	"github.com/russross/blackfriday"
 )
 
@@ -83,6 +84,29 @@ func (c Context) IP() string {
 	return ip
 }
 
+// To mock the net.InterfaceAddrs from the test.
+var networkInterfacesFn = net.InterfaceAddrs
+
+// ServerIP gets the (local) IP address of the server.
+// TODO: The bind directive should be honored in this method (see PR #1474).
+func (c Context) ServerIP() string {
+	addrs, err := networkInterfacesFn()
+	if err != nil {
+		return ""
+	}
+
+	for _, address := range addrs {
+		// Validate the address and check if it's not a loopback
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil || ipnet.IP.To16() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+
+	return ""
+}
+
 // URI returns the raw, unprocessed request URI (including query
 // string and hash) obtained directly from the Request-Line of
 // the HTTP request.
@@ -110,7 +134,7 @@ func (c Context) Port() (string, error) {
 	if err != nil {
 		if !strings.Contains(c.Req.Host, ":") {
 			// common with sites served on the default port 80
-			return "80", nil
+			return HTTPPort, nil
 		}
 		return "", err
 	}
@@ -320,4 +344,13 @@ func (c Context) Files(name string) ([]string, error) {
 	}
 
 	return names, nil
+}
+
+// IsMITM returns true if it seems likely that the TLS connection
+// is being intercepted.
+func (c Context) IsMITM() bool {
+	if val, ok := c.Req.Context().Value(caddy.CtxKey("mitm")).(bool); ok {
+		return val
+	}
+	return false
 }

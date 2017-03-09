@@ -2,6 +2,17 @@ package protocol
 
 import "time"
 
+// MaxPacketSize is the maximum packet size, including the public header, that we use for sending packets
+// This is the value used by Chromium for a QUIC packet sent using IPv6 (for IPv4 it would be 1370)
+const MaxPacketSize ByteCount = 1350
+
+// MaxFrameAndPublicHeaderSize is the maximum size of a QUIC frame plus PublicHeader
+const MaxFrameAndPublicHeaderSize = MaxPacketSize - 12 /*crypto signature*/
+
+// NonForwardSecurePacketSizeReduction is the number of bytes a non forward-secure packet has to be smaller than a forward-secure packet
+// This makes sure that those packets can always be retransmitted without splitting the contained StreamFrames
+const NonForwardSecurePacketSizeReduction = 50
+
 // DefaultMaxCongestionWindow is the default for the max congestion window
 const DefaultMaxCongestionWindow = 1000
 
@@ -11,6 +22,10 @@ const InitialCongestionWindow = 32
 // MaxUndecryptablePackets limits the number of undecryptable packets that a
 // session queues for later until it sends a public reset.
 const MaxUndecryptablePackets = 10
+
+// PublicResetTimeout is the time to wait before sending a Public Reset when receiving too many undecryptable packets during the handshake
+// This timeout allows the Go scheduler to switch to the Go rountine that reads the crypto stream and to escalate the crypto
+const PublicResetTimeout = 500 * time.Millisecond
 
 // AckSendDelay is the maximum delay that can be applied to an ACK for a retransmittable packet
 // This is the value Chromium is using
@@ -39,6 +54,10 @@ const MaxReceiveStreamFlowControlWindowClient ByteCount = 6 * (1 << 20) // 6 MB
 // MaxReceiveConnectionFlowControlWindowClient is the connection-level flow control window for receiving data, for the server
 // This is the value that Google servers are using
 const MaxReceiveConnectionFlowControlWindowClient ByteCount = 15 * (1 << 20) // 15 MB
+
+// ConnectionFlowControlMultiplier determines how much larger the connection flow control windows needs to be relative to any stream's flow control window
+// This is the value that Chromium is using
+const ConnectionFlowControlMultiplier = 1.5
 
 // MaxStreamsPerConnection is the maximum value accepted for the number of streams per connection
 const MaxStreamsPerConnection = 100

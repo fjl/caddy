@@ -1,6 +1,7 @@
 package h2quic
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 )
 
 type h2quicClient interface {
+	Dial() error
 	Do(*http.Request) (*http.Response, error)
 }
 
@@ -27,6 +29,10 @@ type QuicRoundTripper struct {
 	// explicitly requested gzip it is not automatically
 	// uncompressed.
 	DisableCompression bool
+
+	// TLSClientConfig specifies the TLS configuration to use with
+	// tls.Client. If nil, the default configuration is used.
+	TLSClientConfig *tls.Config
 
 	clients map[string]h2quicClient
 }
@@ -87,8 +93,8 @@ func (r *QuicRoundTripper) getClient(hostname string) (h2quicClient, error) {
 
 	client, ok := r.clients[hostname]
 	if !ok {
-		var err error
-		client, err = NewClient(r, hostname)
+		client = NewClient(r, r.TLSClientConfig, hostname)
+		err := client.Dial()
 		if err != nil {
 			return nil, err
 		}

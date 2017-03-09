@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
+	quic "github.com/lucas-clemente/quic-go"
 	"github.com/lucas-clemente/quic-go/protocol"
 	"github.com/lucas-clemente/quic-go/qerr"
 	"github.com/lucas-clemente/quic-go/utils"
@@ -20,9 +20,12 @@ import (
 )
 
 type streamCreator interface {
-	GetOrOpenStream(protocol.StreamID) (utils.Stream, error)
-	Close(error) error
-	RemoteAddr() *net.UDPAddr
+	quic.Session
+	GetOrOpenStream(protocol.StreamID) (quic.Stream, error)
+}
+
+type remoteCloser interface {
+	CloseRemote(protocol.ByteCount)
 }
 
 // Server is a HTTP2 server listening for QUIC connections.
@@ -34,8 +37,8 @@ type Server struct {
 
 	port uint32 // used atomically
 
-	server      *quic.Server
-	serverMutex sync.Mutex
+	listenerMutex sync.Mutex
+	listener      quic.Listener
 }
 
 // ListenAndServe listens on the UDP address s.Addr and calls s.Handler to handle HTTP/2 requests on incoming connections.
@@ -71,31 +74,44 @@ func (s *Server) serveImpl(tlsConfig *tls.Config, conn *net.UDPConn) error {
 	if s.Server == nil {
 		return errors.New("use of h2quic.Server without http.Server")
 	}
-	s.serverMutex.Lock()
-	if s.server != nil {
-		s.serverMutex.Unlock()
+	s.listenerMutex.Lock()
+	if s.listener != nil {
+		s.listenerMutex.Unlock()
 		return errors.New("ListenAndServe may only be called once")
 	}
+	config := quic.Config{
+		TLSConfig: tlsConfig,
+		ConnState: func(session quic.Session, connState quic.ConnState) {
+			sess := session.(streamCreator)
+			if connState == quic.ConnStateVersionNegotiated {
+				s.handleHeaderStream(sess)
+			}
+		},
+	}
+	var ln quic.Listener
 	var err error
-	server, err := quic.NewServer(s.Addr, tlsConfig, s.handleStreamCb)
+	if conn == nil {
+		ln, err = quic.ListenAddr(s.Addr, &config)
+	} else {
+		ln, err = quic.Listen(conn, &config)
+	}
 	if err != nil {
-		s.serverMutex.Unlock()
+		s.listenerMutex.Unlock()
 		return err
 	}
-	s.server = server
-	s.serverMutex.Unlock()
-	if conn == nil {
-		return server.ListenAndServe()
+	s.listener = ln
+	s.listenerMutex.Unlock()
+	return ln.Serve()
+}
+
+func (s *Server) handleHeaderStream(session streamCreator) {
+	stream, err := session.AcceptStream()
+	if err != nil {
+		session.Close(qerr.Error(qerr.InvalidHeadersStreamData, err.Error()))
+		return
 	}
-	return server.Serve(conn)
-}
-
-func (s *Server) handleStreamCb(session *quic.Session, stream utils.Stream) {
-	s.handleStream(session, stream)
-}
-
-func (s *Server) handleStream(session streamCreator, stream utils.Stream) {
 	if stream.StreamID() != 3 {
+		session.Close(qerr.Error(qerr.InternalError, "h2quic server BUG: header stream does not have stream ID 3"))
 		return
 	}
 
@@ -112,13 +128,14 @@ func (s *Server) handleStream(session streamCreator, stream utils.Stream) {
 				if _, ok := err.(*qerr.QuicError); !ok {
 					utils.Errorf("error handling h2 request: %s", err.Error())
 				}
+				session.Close(qerr.Error(qerr.InvalidHeadersStreamData, err.Error()))
 				return
 			}
 		}
 	}()
 }
 
-func (s *Server) handleRequest(session streamCreator, headerStream utils.Stream, headerStreamMutex *sync.Mutex, hpackDecoder *hpack.Decoder, h2framer *http2.Framer) error {
+func (s *Server) handleRequest(session streamCreator, headerStream quic.Stream, headerStreamMutex *sync.Mutex, hpackDecoder *hpack.Decoder, h2framer *http2.Framer) error {
 	h2frame, err := h2framer.ReadFrame()
 	if err != nil {
 		return err
@@ -153,15 +170,20 @@ func (s *Server) handleRequest(session streamCreator, headerStream utils.Stream,
 	if err != nil {
 		return err
 	}
+	// this can happen if the client immediately closes the data stream after sending the request and the runtime processes the reset before the request
+	if dataStream == nil {
+		return nil
+	}
 
 	var streamEnded bool
 	if h2headersFrame.StreamEnded() {
-		dataStream.CloseRemote(0)
+		dataStream.(remoteCloser).CloseRemote(0)
 		streamEnded = true
 		_, _ = dataStream.Read([]byte{0}) // read the eof
 	}
 
-	req.Body = newRequestBody(dataStream)
+	reqBody := newRequestBody(dataStream)
+	req.Body = reqBody
 
 	responseWriter := newResponseWriter(headerStream, headerStreamMutex, dataStream, protocol.StreamID(h2headersFrame.StreamID))
 
@@ -190,7 +212,7 @@ func (s *Server) handleRequest(session streamCreator, headerStream utils.Stream,
 			responseWriter.WriteHeader(200)
 		}
 		if responseWriter.dataStream != nil {
-			if !streamEnded && !req.Body.(*requestBody).requestRead {
+			if !streamEnded && !reqBody.requestRead {
 				responseWriter.dataStream.Reset(nil)
 			}
 			responseWriter.dataStream.Close()
@@ -207,11 +229,11 @@ func (s *Server) handleRequest(session streamCreator, headerStream utils.Stream,
 // Close the server immediately, aborting requests and sending CONNECTION_CLOSE frames to connected clients.
 // Close in combination with ListenAndServe() (instead of Serve()) may race if it is called before a UDP socket is established.
 func (s *Server) Close() error {
-	s.serverMutex.Lock()
-	defer s.serverMutex.Unlock()
-	if s.server != nil {
-		err := s.server.Close()
-		s.server = nil
+	s.listenerMutex.Lock()
+	defer s.listenerMutex.Unlock()
+	if s.listener != nil {
+		err := s.listener.Close()
+		s.listener = nil
 		return err
 	}
 	return nil

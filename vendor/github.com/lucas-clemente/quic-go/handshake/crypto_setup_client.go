@@ -3,6 +3,7 @@ package handshake
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ type cryptoSetupClient struct {
 	version            protocol.VersionNumber
 	negotiatedVersions []protocol.VersionNumber
 
-	cryptoStream utils.Stream
+	cryptoStream io.ReadWriter
 
 	serverConfig *serverConfigClient
 
@@ -40,16 +41,16 @@ type cryptoSetupClient struct {
 	clientHelloCounter int
 	serverVerified     bool // has the certificate chain and the proof already been verified
 	keyDerivation      KeyDerivationFunction
+	keyExchange        KeyExchangeFunction
 
 	receivedSecurePacket bool
 	secureAEAD           crypto.AEAD
 	forwardSecureAEAD    crypto.AEAD
-	aeadChanged          chan struct{}
+	aeadChanged          chan protocol.EncryptionLevel
 
 	connectionParameters ConnectionParametersManager
 }
 
-var _ crypto.AEAD = &cryptoSetupClient{}
 var _ CryptoSetup = &cryptoSetupClient{}
 
 var (
@@ -63,9 +64,10 @@ func NewCryptoSetupClient(
 	hostname string,
 	connID protocol.ConnectionID,
 	version protocol.VersionNumber,
-	cryptoStream utils.Stream,
+	cryptoStream io.ReadWriter,
+	tlsConfig *tls.Config,
 	connectionParameters ConnectionParametersManager,
-	aeadChanged chan struct{},
+	aeadChanged chan protocol.EncryptionLevel,
 	negotiatedVersions []protocol.VersionNumber,
 ) (CryptoSetup, error) {
 	return &cryptoSetupClient{
@@ -73,9 +75,10 @@ func NewCryptoSetupClient(
 		connID:               connID,
 		version:              version,
 		cryptoStream:         cryptoStream,
-		certManager:          crypto.NewCertManager(),
+		certManager:          crypto.NewCertManager(tlsConfig),
 		connectionParameters: connectionParameters,
 		keyDerivation:        crypto.DeriveKeysAESGCM,
+		keyExchange:          getEphermalKEX,
 		aeadChanged:          aeadChanged,
 		negotiatedVersions:   negotiatedVersions,
 	}, nil
@@ -242,7 +245,7 @@ func (h *cryptoSetupClient) handleSHLOMessage(cryptoData map[Tag][]byte) error {
 		return qerr.InvalidCryptoMessageParameter
 	}
 
-	h.aeadChanged <- struct{}{}
+	h.aeadChanged <- protocol.EncryptionForwardSecure
 
 	return nil
 }
@@ -272,40 +275,63 @@ func (h *cryptoSetupClient) validateVersionList(verTags []byte) bool {
 	return true
 }
 
-func (h *cryptoSetupClient) Open(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, error) {
+func (h *cryptoSetupClient) Open(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, protocol.EncryptionLevel, error) {
 	if h.forwardSecureAEAD != nil {
 		data, err := h.forwardSecureAEAD.Open(dst, src, packetNumber, associatedData)
 		if err == nil {
-			return data, nil
+			return data, protocol.EncryptionForwardSecure, nil
 		}
-		return nil, err
+		return nil, protocol.EncryptionUnspecified, err
 	}
 
 	if h.secureAEAD != nil {
 		data, err := h.secureAEAD.Open(dst, src, packetNumber, associatedData)
 		if err == nil {
 			h.receivedSecurePacket = true
-			return data, nil
+			return data, protocol.EncryptionSecure, nil
 		}
 		if h.receivedSecurePacket {
-			return nil, err
+			return nil, protocol.EncryptionUnspecified, err
 		}
 	}
-
-	return (&crypto.NullAEAD{}).Open(dst, src, packetNumber, associatedData)
+	nullAEAD := &crypto.NullAEAD{}
+	res, err := nullAEAD.Open(dst, src, packetNumber, associatedData)
+	if err != nil {
+		return nil, protocol.EncryptionUnspecified, err
+	}
+	return res, protocol.EncryptionUnencrypted, nil
 }
 
-func (h *cryptoSetupClient) Seal(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
+func (h *cryptoSetupClient) Seal(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, protocol.EncryptionLevel) {
 	if h.forwardSecureAEAD != nil {
-		return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData)
+		return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionForwardSecure
 	}
 	if h.secureAEAD != nil {
-		return h.secureAEAD.Seal(dst, src, packetNumber, associatedData)
+		return h.secureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionSecure
 	}
-	return (&crypto.NullAEAD{}).Seal(dst, src, packetNumber, associatedData)
+	return (&crypto.NullAEAD{}).Seal(dst, src, packetNumber, associatedData), protocol.EncryptionUnencrypted
 }
 
-func (h *cryptoSetupClient) DiversificationNonce() []byte {
+func (h *cryptoSetupClient) SealWith(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte, forceEncryptionLevel protocol.EncryptionLevel) ([]byte, protocol.EncryptionLevel, error) {
+	switch forceEncryptionLevel {
+	case protocol.EncryptionUnencrypted:
+		return (&crypto.NullAEAD{}).Seal(dst, src, packetNumber, associatedData), protocol.EncryptionUnencrypted, nil
+	case protocol.EncryptionSecure:
+		if h.secureAEAD == nil {
+			return nil, protocol.EncryptionUnspecified, errors.New("CryptoSetupClient: no secureAEAD")
+		}
+		return h.secureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionSecure, nil
+	case protocol.EncryptionForwardSecure:
+		if h.forwardSecureAEAD == nil {
+			return nil, protocol.EncryptionUnspecified, errors.New("CryptoSetupClient: no forwardSecureAEAD")
+		}
+		return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionForwardSecure, nil
+	}
+
+	return nil, protocol.EncryptionUnspecified, errors.New("no encryption level specified")
+}
+
+func (h *cryptoSetupClient) DiversificationNonce(bool) []byte {
 	panic("not needed for cryptoSetupClient")
 }
 
@@ -453,7 +479,7 @@ func (h *cryptoSetupClient) maybeUpgradeCrypto() error {
 			return err
 		}
 
-		h.aeadChanged <- struct{}{}
+		h.aeadChanged <- protocol.EncryptionSecure
 	}
 
 	return nil
