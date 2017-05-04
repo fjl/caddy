@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 )
 
@@ -33,17 +33,28 @@ type Handler struct {
 	ServerPort      string
 }
 
-// When a rewrite is performed, a header field of this name
-// is added to the request
-// It contains the original request URI before the rewrite.
-const internalRewriteFieldName = "Caddy-Rewrite-Original-URI"
-
 // ServeHTTP satisfies the httpserver.Handler interface.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	for _, rule := range h.Rules {
-
-		// First requirement: Base path must match and the path must be allowed.
-		if !httpserver.Path(r.URL.Path).Matches(rule.Path) || !rule.AllowedPath(r.URL.Path) {
+		// First requirement: Base path must match request path. If it doesn't,
+		// we check to make sure the leading slash is not missing, and if so,
+		// we check again with it prepended. This is in case people forget
+		// a leading slash when performing rewrites, and we don't want to expose
+		// the contents of the (likely PHP) script. See issue #1645.
+		hpath := httpserver.Path(r.URL.Path)
+		if !hpath.Matches(rule.Path) {
+			if strings.HasPrefix(string(hpath), "/") {
+				// this is a normal-looking path, and it doesn't match; try next rule
+				continue
+			}
+			hpath = httpserver.Path("/" + string(hpath)) // prepend leading slash
+			if !hpath.Matches(rule.Path) {
+				// even after fixing the request path, it still doesn't match; try next rule
+				continue
+			}
+		}
+		// The path must also be allowed (not ignored).
+		if !rule.AllowedPath(r.URL.Path) {
 			continue
 		}
 
@@ -91,7 +102,14 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 			fcgiBackend.SetSendTimeout(rule.SendTimeout)
 
 			var resp *http.Response
-			contentLength, _ := strconv.Atoi(r.Header.Get("Content-Length"))
+
+			var contentLength int64
+			// if ContentLength is already set
+			if r.ContentLength > 0 {
+				contentLength = r.ContentLength
+			} else {
+				contentLength, _ = strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
+			}
 			switch r.Method {
 			case "HEAD":
 				resp, err = fcgiBackend.Head(env)
@@ -212,23 +230,19 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 	// Strip PATH_INFO from SCRIPT_NAME
 	scriptName = strings.TrimSuffix(scriptName, pathInfo)
 
-	// Get the request URI. The request URI might be as it came in over the wire,
-	// or it might have been rewritten internally by the rewrite middleware (see issue #256).
-	// If it was rewritten, there will be a header indicating the original URL,
-	// which is needed to get the correct RequestURI value for PHP apps.
-	reqURI := r.URL.RequestURI()
-	if origURI := r.Header.Get(internalRewriteFieldName); origURI != "" {
-		reqURI = origURI
-	}
+	// Get the request URI from context. The context stores the original URI in case
+	// it was changed by a middleware such as rewrite. By default, we pass the
+	// original URI in as the value of REQUEST_URI (the user can overwrite this
+	// if desired). Most PHP apps seem to want the original URI. Besides, this is
+	// how nginx defaults: http://stackoverflow.com/a/12485156/1048862
+	reqURL, _ := r.Context().Value(httpserver.OriginalURLCtxKey).(url.URL)
 
-	// Retrieve name of remote user that was set by some downstream middleware,
-	// possibly basicauth.
-	remoteUser, _ := r.Context().Value(caddy.CtxKey("remote_user")).(string) // Blank if not set
+	// Retrieve name of remote user that was set by some downstream middleware such as basicauth.
+	remoteUser, _ := r.Context().Value(httpserver.RemoteUserCtxKey).(string)
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
 	env = map[string]string{
-
 		// Variables defined in CGI 1.1 spec
 		"AUTH_TYPE":         "", // Not used
 		"CONTENT_LENGTH":    r.Header.Get("Content-Length"),
@@ -251,13 +265,13 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 		"DOCUMENT_ROOT":   rule.Root,
 		"DOCUMENT_URI":    docURI,
 		"HTTP_HOST":       r.Host, // added here, since not always part of headers
-		"REQUEST_URI":     reqURI,
+		"REQUEST_URI":     reqURL.RequestURI(),
 		"SCRIPT_FILENAME": scriptFilename,
 		"SCRIPT_NAME":     scriptName,
 	}
 
-	// compliance with the CGI specification that PATH_TRANSLATED
-	// should only exist if PATH_INFO is defined.
+	// compliance with the CGI specification requires that
+	// PATH_TRANSLATED should only exist if PATH_INFO is defined.
 	// Info: https://www.ietf.org/rfc/rfc3875 Page 14
 	if env["PATH_INFO"] != "" {
 		env["PATH_TRANSLATED"] = filepath.Join(rule.Root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
@@ -268,18 +282,14 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 		env["HTTPS"] = "on"
 	}
 
+	// Add env variables from config (with support for placeholders in values)
 	replacer := httpserver.NewReplacer(r, nil, "")
-	// Add env variables from config
 	for _, envVar := range rule.EnvVars {
-		// replace request placeholders in environment variables
 		env[envVar[0]] = replacer.Replace(envVar[1])
 	}
 
-	// Add all HTTP headers (except Caddy-Rewrite-Original-URI ) to env variables
+	// Add all HTTP headers to env variables
 	for field, val := range r.Header {
-		if strings.ToLower(field) == strings.ToLower(internalRewriteFieldName) {
-			continue
-		}
 		header := strings.ToUpper(field)
 		header = headerNameReplacer.Replace(header)
 		env["HTTP_"+header] = strings.Join(val, ", ")

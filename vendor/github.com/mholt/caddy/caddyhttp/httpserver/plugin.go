@@ -70,7 +70,7 @@ func hideCaddyfile(cctx caddy.Context) error {
 			return err
 		}
 		if strings.HasPrefix(absOriginCaddyfile, absRoot) {
-			cfg.HiddenFiles = append(cfg.HiddenFiles, strings.TrimPrefix(absOriginCaddyfile, absRoot))
+			cfg.HiddenFiles = append(cfg.HiddenFiles, filepath.ToSlash(strings.TrimPrefix(absOriginCaddyfile, absRoot)))
 		}
 	}
 	return nil
@@ -254,7 +254,7 @@ func groupSiteConfigsByListenAddr(configs []*SiteConfig) (map[string][]*SiteConf
 		// We would add a special case here so that localhost addresses
 		// bind to 127.0.0.1 if conf.ListenHost is not already set, which
 		// would prevent outsiders from even connecting; but that was problematic:
-		// https://forum.caddyserver.com/t/wildcard-virtual-domains-with-wildcard-roots/221/5?u=matt
+		// https://caddy.community/t/wildcard-virtual-domains-with-wildcard-roots/221/5?u=matt
 
 		if conf.Addr.Port == "" {
 			conf.Addr.Port = Port
@@ -434,6 +434,7 @@ func RegisterDevDirective(name, before string) {
 var directives = []string{
 	// primitive actions that set up the fundamental vitals of each config
 	"root",
+	"index",
 	"bind",
 	"maxrequestbody", // TODO: 'limits'
 	"timeouts",
@@ -444,6 +445,9 @@ var directives = []string{
 	"shutdown",
 	"realip", // github.com/captncraig/caddy-realip
 	"git",    // github.com/abiosoft/caddy-git
+
+	// directives that add listener middleware to the stack
+	"proxyprotocol", // github.com/mastercactapus/caddy-proxyprotocol
 
 	// directives that add middleware to the stack
 	"locale", // github.com/simia-tech/caddy-locale
@@ -471,11 +475,11 @@ var directives = []string{
 	"internal",
 	"pprof",
 	"expvar",
+	"push",
 	"prometheus", // github.com/miekg/caddy-prometheus
 	"proxy",
 	"fastcgi",
 	"cgi", // github.com/jung-kurt/caddy-cgi
-	"push",
 	"websocket",
 	"filemanager", // github.com/hacdias/caddy-filemanager
 	"markdown",

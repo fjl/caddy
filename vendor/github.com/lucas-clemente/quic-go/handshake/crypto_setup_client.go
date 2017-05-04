@@ -44,6 +44,7 @@ type cryptoSetupClient struct {
 	keyExchange        KeyExchangeFunction
 
 	receivedSecurePacket bool
+	nullAEAD             crypto.AEAD
 	secureAEAD           crypto.AEAD
 	forwardSecureAEAD    crypto.AEAD
 	aeadChanged          chan protocol.EncryptionLevel
@@ -79,6 +80,7 @@ func NewCryptoSetupClient(
 		connectionParameters: connectionParameters,
 		keyDerivation:        crypto.DeriveKeysAESGCM,
 		keyExchange:          getEphermalKEX,
+		nullAEAD:             crypto.NewNullAEAD(protocol.PerspectiveClient, version),
 		aeadChanged:          aeadChanged,
 		negotiatedVersions:   negotiatedVersions,
 	}, nil
@@ -92,7 +94,10 @@ func (h *cryptoSetupClient) HandleCryptoStream() error {
 		}
 
 		// send CHLOs until the forward secure encryption is established
-		if h.forwardSecureAEAD == nil {
+		h.mutex.RLock()
+		sendCHLO := h.forwardSecureAEAD == nil
+		h.mutex.RUnlock()
+		if sendCHLO {
 			err = h.sendCHLO()
 			if err != nil {
 				return err
@@ -276,6 +281,9 @@ func (h *cryptoSetupClient) validateVersionList(verTags []byte) bool {
 }
 
 func (h *cryptoSetupClient) Open(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, protocol.EncryptionLevel, error) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
 	if h.forwardSecureAEAD != nil {
 		data, err := h.forwardSecureAEAD.Open(dst, src, packetNumber, associatedData)
 		if err == nil {
@@ -294,44 +302,57 @@ func (h *cryptoSetupClient) Open(dst, src []byte, packetNumber protocol.PacketNu
 			return nil, protocol.EncryptionUnspecified, err
 		}
 	}
-	nullAEAD := &crypto.NullAEAD{}
-	res, err := nullAEAD.Open(dst, src, packetNumber, associatedData)
+	res, err := h.nullAEAD.Open(dst, src, packetNumber, associatedData)
 	if err != nil {
 		return nil, protocol.EncryptionUnspecified, err
 	}
 	return res, protocol.EncryptionUnencrypted, nil
 }
 
-func (h *cryptoSetupClient) Seal(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, protocol.EncryptionLevel) {
+func (h *cryptoSetupClient) GetSealer() (protocol.EncryptionLevel, Sealer) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
 	if h.forwardSecureAEAD != nil {
-		return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionForwardSecure
+		return protocol.EncryptionForwardSecure, h.sealForwardSecure
+	} else if h.secureAEAD != nil {
+		return protocol.EncryptionSecure, h.sealSecure
+	} else {
+		return protocol.EncryptionUnencrypted, h.sealUnencrypted
 	}
-	if h.secureAEAD != nil {
-		return h.secureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionSecure
-	}
-	return (&crypto.NullAEAD{}).Seal(dst, src, packetNumber, associatedData), protocol.EncryptionUnencrypted
 }
 
-func (h *cryptoSetupClient) SealWith(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte, forceEncryptionLevel protocol.EncryptionLevel) ([]byte, protocol.EncryptionLevel, error) {
-	switch forceEncryptionLevel {
+func (h *cryptoSetupClient) GetSealerWithEncryptionLevel(encLevel protocol.EncryptionLevel) (Sealer, error) {
+	switch encLevel {
 	case protocol.EncryptionUnencrypted:
-		return (&crypto.NullAEAD{}).Seal(dst, src, packetNumber, associatedData), protocol.EncryptionUnencrypted, nil
+		return h.sealUnencrypted, nil
 	case protocol.EncryptionSecure:
 		if h.secureAEAD == nil {
-			return nil, protocol.EncryptionUnspecified, errors.New("CryptoSetupClient: no secureAEAD")
+			return nil, errors.New("CryptoSetupClient: no secureAEAD")
 		}
-		return h.secureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionSecure, nil
+		return h.sealSecure, nil
 	case protocol.EncryptionForwardSecure:
 		if h.forwardSecureAEAD == nil {
-			return nil, protocol.EncryptionUnspecified, errors.New("CryptoSetupClient: no forwardSecureAEAD")
+			return nil, errors.New("CryptoSetupClient: no forwardSecureAEAD")
 		}
-		return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData), protocol.EncryptionForwardSecure, nil
+		return h.sealForwardSecure, nil
 	}
-
-	return nil, protocol.EncryptionUnspecified, errors.New("no encryption level specified")
+	return nil, errors.New("CryptoSetupClient: no encryption level specified")
 }
 
-func (h *cryptoSetupClient) DiversificationNonce(bool) []byte {
+func (h *cryptoSetupClient) sealUnencrypted(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
+	return h.nullAEAD.Seal(dst, src, packetNumber, associatedData)
+}
+
+func (h *cryptoSetupClient) sealSecure(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
+	return h.secureAEAD.Seal(dst, src, packetNumber, associatedData)
+}
+
+func (h *cryptoSetupClient) sealForwardSecure(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
+	return h.forwardSecureAEAD.Seal(dst, src, packetNumber, associatedData)
+}
+
+func (h *cryptoSetupClient) DiversificationNonce() []byte {
 	panic("not needed for cryptoSetupClient")
 }
 
@@ -346,19 +367,11 @@ func (h *cryptoSetupClient) SetDiversificationNonce(data []byte) error {
 	return nil
 }
 
-func (h *cryptoSetupClient) LockForSealing() {
-
-}
-
-func (h *cryptoSetupClient) UnlockForSealing() {
-
-}
-
 func (h *cryptoSetupClient) HandshakeComplete() bool {
 	h.mutex.RLock()
-	complete := h.forwardSecureAEAD != nil
-	h.mutex.RUnlock()
-	return complete
+	defer h.mutex.RUnlock()
+
+	return h.forwardSecureAEAD != nil
 }
 
 func (h *cryptoSetupClient) sendCHLO() error {
@@ -401,7 +414,7 @@ func (h *cryptoSetupClient) getTags() (map[Tag][]byte, error) {
 		tags[TagCCS] = ccs
 	}
 
-	versionTag := make([]byte, 4, 4)
+	versionTag := make([]byte, 4)
 	binary.LittleEndian.PutUint32(versionTag, protocol.VersionNumberToTag(h.version))
 	tags[TagVER] = versionTag
 
@@ -419,7 +432,7 @@ func (h *cryptoSetupClient) getTags() (map[Tag][]byte, error) {
 		leafCert := h.certManager.GetLeafCert()
 		if leafCert != nil {
 			certHash, _ := h.certManager.GetLeafCertHash()
-			xlct := make([]byte, 8, 8)
+			xlct := make([]byte, 8)
 			binary.LittleEndian.PutUint64(xlct, certHash)
 
 			tags[TagNONC] = h.nonc

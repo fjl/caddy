@@ -238,29 +238,24 @@ func (r *replacer) getSubstitution(key string) string {
 		}
 		return host
 	case "{path}":
-		// if a rewrite has happened, the original URI should be used as the path
-		// rather than the rewritten URI
-		path := r.request.Header.Get("Caddy-Rewrite-Original-URI")
-		if path == "" {
-			path = r.request.URL.Path
-		}
-		return path
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return u.Path
 	case "{path_escaped}":
-		path := r.request.Header.Get("Caddy-Rewrite-Original-URI")
-		if path == "" {
-			path = r.request.URL.Path
-		}
-		return url.QueryEscape(path)
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return url.QueryEscape(u.Path)
 	case "{rewrite_path}":
 		return r.request.URL.Path
 	case "{rewrite_path_escaped}":
 		return url.QueryEscape(r.request.URL.Path)
 	case "{query}":
-		return r.request.URL.RawQuery
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return u.RawQuery
 	case "{query_escaped}":
-		return url.QueryEscape(r.request.URL.RawQuery)
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return url.QueryEscape(u.RawQuery)
 	case "{fragment}":
-		return r.request.URL.Fragment
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return u.Fragment
 	case "{proto}":
 		return r.request.Proto
 	case "{remote}":
@@ -276,8 +271,14 @@ func (r *replacer) getSubstitution(key string) string {
 		}
 		return port
 	case "{uri}":
-		return r.request.URL.RequestURI()
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return u.RequestURI()
 	case "{uri_escaped}":
+		u, _ := r.request.Context().Value(OriginalURLCtxKey).(url.URL)
+		return url.QueryEscape(u.RequestURI())
+	case "{rewrite_uri}":
+		return r.request.URL.RequestURI()
+	case "{rewrite_uri_escaped}":
 		return url.QueryEscape(r.request.URL.RequestURI())
 	case "{when}":
 		return now().Format(timeFormat)
@@ -310,9 +311,9 @@ func (r *replacer) getSubstitution(key string) string {
 		if val, ok := r.request.Context().Value(caddy.CtxKey("mitm")).(bool); ok {
 			if val {
 				return "likely"
-			} else {
-				return "unlikely"
 			}
+
+			return "unlikely"
 		}
 		return "unknown"
 	case "{status}":

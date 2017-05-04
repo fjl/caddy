@@ -119,6 +119,11 @@ func (c *flowController) IncrementHighestReceived(increment protocol.ByteCount) 
 }
 
 func (c *flowController) AddBytesRead(n protocol.ByteCount) {
+	// pretend we sent a WindowUpdate when reading the first byte
+	// this way auto-tuning of the window increment already works for the first WindowUpdate
+	if c.bytesRead == 0 {
+		c.lastWindowUpdateTime = time.Now()
+	}
 	c.bytesRead += n
 }
 
@@ -157,7 +162,7 @@ func (c *flowController) maybeAdjustWindowIncrement() {
 		return
 	}
 
-	timeSinceLastWindowUpdate := time.Now().Sub(c.lastWindowUpdateTime)
+	timeSinceLastWindowUpdate := time.Since(c.lastWindowUpdateTime)
 
 	// interval between the window updates is sufficiently large, no need to increase the increment
 	if timeSinceLastWindowUpdate >= 2*rtt {
@@ -189,8 +194,5 @@ func (c *flowController) EnsureMinimumWindowIncrement(inc protocol.ByteCount) {
 }
 
 func (c *flowController) CheckFlowControlViolation() bool {
-	if c.highestReceived > c.receiveWindow {
-		return true
-	}
-	return false
+	return c.highestReceived > c.receiveWindow
 }

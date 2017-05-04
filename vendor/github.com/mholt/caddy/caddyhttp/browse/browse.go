@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	sortByName = "name"
-	sortBySize = "size"
-	sortByTime = "time"
+	sortByName         = "name"
+	sortByNameDirFirst = "namedirfirst"
+	sortBySize         = "size"
+	sortByTime         = "time"
 )
 
 // Browse is an http.Handler that can show a file listing when
@@ -36,7 +37,7 @@ type Browse struct {
 
 // Config is a configuration for browsing in a particular path.
 type Config struct {
-	PathScope string
+	PathScope string // the base path the URL must match to enable browsing
 	Fs        staticfiles.FileServer
 	Variables interface{}
 	Template  *template.Template
@@ -77,10 +78,15 @@ type Listing struct {
 	httpserver.Context
 }
 
-// BreadcrumbMap returns l.Path where every element is a map
-// of URLs and path segment names.
-func (l Listing) BreadcrumbMap() map[string]string {
-	result := map[string]string{}
+// Crumb represents part of a breadcrumb menu.
+type Crumb struct {
+	Link, Text string
+}
+
+// Breadcrumbs returns l.Path where every element maps
+// the link to the text to display.
+func (l Listing) Breadcrumbs() []Crumb {
+	var result []Crumb
 
 	if len(l.Path) == 0 {
 		return result
@@ -93,13 +99,12 @@ func (l Listing) BreadcrumbMap() map[string]string {
 	}
 
 	parts := strings.Split(lpath, "/")
-	for i, part := range parts {
-		if i == 0 && part == "" {
-			// Leading slash (root)
-			result["/"] = "/"
-			continue
+	for i := range parts {
+		txt := parts[i]
+		if i == 0 && parts[i] == "" {
+			txt = "/"
 		}
-		result[strings.Join(parts[:i+1], "/")] = part
+		result = append(result, Crumb{Link: strings.Repeat("../", len(parts)-i-1), Text: txt})
 	}
 
 	return result
@@ -128,6 +133,7 @@ func (fi FileInfo) HumanModTime(format string) string {
 
 // Implement sorting for Listing
 type byName Listing
+type byNameDirFirst Listing
 type bySize Listing
 type byTime Listing
 
@@ -140,6 +146,22 @@ func (l byName) Less(i, j int) bool {
 	return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
 }
 
+// By Name Dir First
+func (l byNameDirFirst) Len() int      { return len(l.Items) }
+func (l byNameDirFirst) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i] }
+
+// Treat upper and lower case equally
+func (l byNameDirFirst) Less(i, j int) bool {
+
+	// if both are dir or file sort normally
+	if l.Items[i].IsDir == l.Items[j].IsDir {
+		return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+	}
+
+	// always sort dir ahead of file
+	return l.Items[i].IsDir
+}
+
 // By Size
 func (l bySize) Len() int      { return len(l.Items) }
 func (l bySize) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i] }
@@ -147,12 +169,21 @@ func (l bySize) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i]
 const directoryOffset = -1 << 31 // = math.MinInt32
 func (l bySize) Less(i, j int) bool {
 	iSize, jSize := l.Items[i].Size, l.Items[j].Size
+
+	// Directory sizes depend on the filesystem implementation,
+	// which is opaque to a visitor, and should indeed does not change if the operator choses to change the fs.
+	// For a consistent user experience directories are pulled to the front…
 	if l.Items[i].IsDir {
-		iSize = directoryOffset + iSize
+		iSize = directoryOffset
 	}
 	if l.Items[j].IsDir {
-		jSize = directoryOffset + jSize
+		jSize = directoryOffset
 	}
+	// … and sorted by name.
+	if l.Items[i].IsDir && l.Items[j].IsDir {
+		return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+	}
+
 	return iSize < jSize
 }
 
@@ -169,6 +200,8 @@ func (l Listing) applySort() {
 		switch l.Sort {
 		case sortByName:
 			sort.Sort(sort.Reverse(byName(l)))
+		case sortByNameDirFirst:
+			sort.Sort(sort.Reverse(byNameDirFirst(l)))
 		case sortBySize:
 			sort.Sort(sort.Reverse(bySize(l)))
 		case sortByTime:
@@ -181,6 +214,8 @@ func (l Listing) applySort() {
 		switch l.Sort {
 		case sortByName:
 			sort.Sort(byName(l))
+		case sortByNameDirFirst:
+			sort.Sort(byNameDirFirst(l))
 		case sortBySize:
 			sort.Sort(bySize(l))
 		case sortByTime:
@@ -216,11 +251,11 @@ func directoryListing(files []os.FileInfo, canGoUp bool, urlPath string, config 
 			fileCount++
 		}
 
-		url := url.URL{Path: "./" + name} // prepend with "./" to fix paths with ':' in the name
-
 		if config.Fs.IsHidden(f) {
 			continue
 		}
+
+		url := url.URL{Path: "./" + name} // prepend with "./" to fix paths with ':' in the name
 
 		fileinfos = append(fileinfos, FileInfo{
 			IsDir:   f.IsDir(),
@@ -298,9 +333,14 @@ func (b Browse) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 
 	// Browsing navigation gets messed up if browsing a directory
 	// that doesn't end in "/" (which it should, anyway)
-	if !strings.HasSuffix(r.URL.Path, "/") {
-		staticfiles.Redirect(w, r, r.URL.Path+"/", http.StatusTemporaryRedirect)
-		return 0, nil
+	u := *r.URL
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	if u.Path[len(u.Path)-1] != '/' {
+		u.Path += "/"
+		http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
+		return http.StatusMovedPermanently, nil
 	}
 
 	return b.ServeListing(w, r, requestedFilepath, bc)
@@ -338,11 +378,11 @@ func (b Browse) handleSortOrder(w http.ResponseWriter, r *http.Request, scope st
 	// If the query 'sort' or 'order' is empty, use defaults or any values previously saved in Cookies
 	switch sort {
 	case "":
-		sort = sortByName
+		sort = sortByNameDirFirst
 		if sortCookie, sortErr := r.Cookie("sort"); sortErr == nil {
 			sort = sortCookie.Value
 		}
-	case sortByName, sortBySize, sortByTime:
+	case sortByName, sortByNameDirFirst, sortBySize, sortByTime:
 		http.SetCookie(w, &http.Cookie{Name: "sort", Value: sort, Path: scope, Secure: r.TLS != nil})
 	}
 

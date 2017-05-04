@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -26,8 +25,7 @@ type packetHandler interface {
 type server struct {
 	config *Config
 
-	conn      net.PacketConn
-	connMutex sync.Mutex
+	conn net.PacketConn
 
 	certChain crypto.CertChain
 	scfg      *handshake.ServerConfig
@@ -84,11 +82,10 @@ func (s *server) Serve() error {
 	for {
 		data := getPacketBuffer()
 		data = data[:protocol.MaxReceivePacketSize]
+		// The packet size should not exceed protocol.MaxReceivePacketSize bytes
+		// If it does, we only read a truncated packet, which will then end up undecryptable
 		n, remoteAddr, err := s.conn.ReadFrom(data)
 		if err != nil {
-			if strings.HasSuffix(err.Error(), "use of closed network connection") {
-				return nil
-			}
 			return err
 		}
 		data = data[:n]
@@ -122,14 +119,9 @@ func (s *server) Addr() net.Addr {
 }
 
 func (s *server) handlePacket(pconn net.PacketConn, remoteAddr net.Addr, packet []byte) error {
-	if protocol.ByteCount(len(packet)) > protocol.MaxReceivePacketSize {
-		return qerr.PacketTooLarge
-	}
-
 	rcvTime := time.Now()
 
 	r := bytes.NewReader(packet)
-
 	hdr, err := ParsePublicHeader(r, protocol.PerspectiveClient)
 	if err != nil {
 		return qerr.Error(qerr.InvalidPacketHeader, err.Error())

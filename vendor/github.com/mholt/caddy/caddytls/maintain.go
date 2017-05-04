@@ -141,7 +141,6 @@ func RenewManagedCertificates(allowPrompts bool) (err error) {
 		} else {
 			// successful renewal, so update in-memory cache by loading
 			// renewed certificate so it will be used with handshakes
-			// TODO: Not until CA has valid OCSP response ready for the new cert... sigh.
 			if cert.Names[len(cert.Names)-1] == "" {
 				// Special case: This is the default certificate. We must
 				// flush it out of the cache so that we no longer point to
@@ -232,7 +231,7 @@ func UpdateOCSPStaples() {
 		// By this point, we've obtained the latest OCSP response.
 		// If there was no staple before, or if the response is updated, make
 		// sure we apply the update to all names on the certificate.
-		if lastNextUpdate.IsZero() || lastNextUpdate != cert.OCSP.NextUpdate {
+		if cert.OCSP != nil && (lastNextUpdate.IsZero() || lastNextUpdate != cert.OCSP.NextUpdate) {
 			log.Printf("[INFO] Advancing OCSP staple for %v from %s to %s",
 				cert.Names, lastNextUpdate, cert.OCSP.NextUpdate)
 			for _, n := range cert.Names {

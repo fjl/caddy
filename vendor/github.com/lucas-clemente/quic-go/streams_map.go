@@ -31,9 +31,7 @@ type streamsMap struct {
 
 	newStream newStreamLambda
 
-	maxOutgoingStreams uint32
 	numOutgoingStreams uint32
-	maxIncomingStreams uint32
 	numIncomingStreams uint32
 }
 
@@ -215,10 +213,7 @@ func (m *streamsMap) Iterate(fn streamLambda) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	openStreams := make([]protocol.StreamID, len(m.openStreams), len(m.openStreams))
-	for i, streamID := range m.openStreams { // copy openStreams
-		openStreams[i] = streamID
-	}
+	openStreams := append([]protocol.StreamID{}, m.openStreams...)
 
 	for _, streamID := range openStreams {
 		cont, err := m.iterateFunc(streamID, fn)

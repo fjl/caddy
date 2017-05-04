@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -215,9 +217,20 @@ func (s *Server) Listen() (net.Listener, error) {
 		}
 	}
 
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		ln = tcpKeepAliveListener{TCPListener: tcpLn}
+	}
+
+	cln := ln.(caddy.Listener)
+	for _, site := range s.sites {
+		for _, m := range site.listenerMiddleware {
+			cln = m(cln)
+		}
+	}
+
 	// Very important to return a concrete caddy.Listener
 	// implementation for graceful restarts.
-	return ln.(*net.TCPListener), nil
+	return cln.(caddy.Listener), nil
 }
 
 // ListenPacket creates udp connection for QUIC if it is enabled,
@@ -234,10 +247,6 @@ func (s *Server) ListenPacket() (net.PacketConn, error) {
 
 // Serve serves requests on ln. It blocks until ln is closed.
 func (s *Server) Serve(ln net.Listener) error {
-	if tcpLn, ok := ln.(*net.TCPListener); ok {
-		ln = tcpKeepAliveListener{TCPListener: tcpLn}
-	}
-
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
@@ -284,11 +293,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	w.Header().Set("Server", "Caddy")
-	c := context.WithValue(r.Context(), caddy.URLPathCtxKey, r.URL.Path)
+	// copy the original, unchanged URL into the context
+	// so it can be referenced by middlewares
+	urlCopy := *r.URL
+	if r.URL.User != nil {
+		userInfo := new(url.Userinfo)
+		*userInfo = *r.URL.User
+		urlCopy.User = userInfo
+	}
+	c := context.WithValue(r.Context(), OriginalURLCtxKey, urlCopy)
 	r = r.WithContext(c)
 
-	sanitizePath(r)
+	w.Header().Set("Server", "Caddy")
 
 	status, _ := s.serveHTTP(w, r)
 
@@ -343,18 +359,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 		}
 	}
 
-	// URL fields other than Path and RawQuery will be empty for most server
-	// requests. Hence, the request URL is updated with the scheme and host
-	// from the virtual host's site address.
-	if vhostURL, err := url.Parse(vhost.Addr.String()); err == nil {
-		r.URL.Scheme = vhostURL.Scheme
-		r.URL.Host = vhostURL.Host
-	}
-
 	// Apply the path-based request body size limit
 	// The error returned by MaxBytesReader is meant to be handled
 	// by whichever middleware/plugin that receives it when calling
 	// .Read() or a similar method on the request body
+	// TODO: Make this middleware instead?
 	if r.Body != nil {
 		for _, pathlimit := range vhost.MaxRequestBodySizes {
 			if Path(r.URL.Path).Matches(pathlimit.Path) {
@@ -407,28 +416,6 @@ func (s *Server) Stop() error {
 	}
 
 	return nil
-}
-
-// sanitizePath collapses any ./ ../ /// madness which helps prevent
-// path traversal attacks. Note to middleware: use the value within the
-// request's context at key caddy.URLPathContextKey to access the
-// "original" URL.Path value.
-func sanitizePath(r *http.Request) {
-	if r.URL.Path == "/" {
-		return
-	}
-	cleanedPath := CleanPath(r.URL.Path)
-	if cleanedPath == "." {
-		r.URL.Path = "/"
-	} else {
-		if !strings.HasPrefix(cleanedPath, "/") {
-			cleanedPath = "/" + cleanedPath
-		}
-		if strings.HasSuffix(r.URL.Path, "/") && !strings.HasSuffix(cleanedPath, "/") {
-			cleanedPath = cleanedPath + "/"
-		}
-		r.URL.Path = cleanedPath
-	}
 }
 
 // OnStartupComplete lists the sites served by this server
@@ -560,3 +547,20 @@ func WriteTextResponse(w http.ResponseWriter, status int, body string) {
 	w.WriteHeader(status)
 	w.Write([]byte(body))
 }
+
+// SafePath joins siteRoot and reqPath and converts it to a path that can
+// be used to access a path on the local disk. It ensures the path does
+// not traverse outside of the site root.
+//
+// If opening a file, use http.Dir instead.
+func SafePath(siteRoot, reqPath string) string {
+	reqPath = filepath.ToSlash(reqPath)
+	reqPath = strings.Replace(reqPath, "\x00", "", -1) // NOTE: Go 1.9 checks for null bytes in the syscall package
+	if siteRoot == "" {
+		siteRoot = "."
+	}
+	return filepath.Join(siteRoot, filepath.FromSlash(path.Clean("/"+reqPath)))
+}
+
+// OriginalURLCtxKey is the key for accessing the original, incoming URL on an HTTP request.
+const OriginalURLCtxKey = caddy.CtxKey("original_url")

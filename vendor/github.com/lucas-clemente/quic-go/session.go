@@ -32,7 +32,7 @@ type receivedPacket struct {
 var (
 	errRstStreamOnInvalidStream   = errors.New("RST_STREAM received for unknown stream")
 	errWindowUpdateOnClosedStream = errors.New("WINDOW_UPDATE received for an already closed stream")
-	errSessionAlreadyClosed       = errors.New("Cannot close session. It was already closed before.")
+	errSessionAlreadyClosed       = errors.New("cannot close session; it was already closed before")
 )
 
 // cryptoChangeCallback is called every time the encryption level changes
@@ -169,8 +169,7 @@ func (s *session) setup() {
 	s.rttStats = &congestion.RTTStats{}
 	flowControlManager := flowcontrol.NewFlowControlManager(s.connectionParameters, s.rttStats)
 
-	var sentPacketHandler ackhandler.SentPacketHandler
-	sentPacketHandler = ackhandler.NewSentPacketHandler(s.rttStats)
+	sentPacketHandler := ackhandler.NewSentPacketHandler(s.rttStats)
 
 	now := time.Now()
 
@@ -251,11 +250,17 @@ runLoop:
 			s.close(err)
 		}
 
+		now := time.Now()
+		if s.sentPacketHandler.GetAlarmTimeout().Before(now) {
+			// This could cause packets to be retransmitted, so check it before trying
+			// to send packets.
+			s.sentPacketHandler.OnAlarm()
+		}
+
 		if err := s.sendPacket(); err != nil {
 			s.close(err)
 		}
-		now := time.Now()
-		if !s.receivedTooManyUndecrytablePacketsTime.IsZero() && s.receivedTooManyUndecrytablePacketsTime.Add(protocol.PublicResetTimeout).Before(now) {
+		if !s.receivedTooManyUndecrytablePacketsTime.IsZero() && s.receivedTooManyUndecrytablePacketsTime.Add(protocol.PublicResetTimeout).Before(now) && len(s.undecryptablePackets) != 0 {
 			s.close(qerr.Error(qerr.DecryptionFailure, "too many undecryptable packets received"))
 		}
 		if now.Sub(s.lastNetworkActivityTime) >= s.idleTimeout() {
@@ -277,8 +282,8 @@ func (s *session) maybeResetTimer() {
 	if !s.nextAckScheduledTime.IsZero() {
 		nextDeadline = utils.MinTime(nextDeadline, s.nextAckScheduledTime)
 	}
-	if rtoTime := s.sentPacketHandler.TimeOfFirstRTO(); !rtoTime.IsZero() {
-		nextDeadline = utils.MinTime(nextDeadline, rtoTime)
+	if lossTime := s.sentPacketHandler.GetAlarmTimeout(); !lossTime.IsZero() {
+		nextDeadline = utils.MinTime(nextDeadline, lossTime)
 	}
 	if !s.cryptoSetup.HandshakeComplete() {
 		handshakeDeadline := s.sessionCreationTime.Add(protocol.MaxTimeForCryptoHandshake)
@@ -441,11 +446,7 @@ func (s *session) handleStreamFrame(frame *frames.StreamFrame) error {
 		// ignore this StreamFrame
 		return nil
 	}
-	err = str.AddStreamFrame(frame)
-	if err != nil {
-		return err
-	}
-	return nil
+	return str.AddStreamFrame(frame)
 }
 
 func (s *session) handleWindowUpdateFrame(frame *frames.WindowUpdateFrame) error {
@@ -476,10 +477,7 @@ func (s *session) handleRstStreamFrame(frame *frames.RstStreamFrame) error {
 }
 
 func (s *session) handleAckFrame(frame *frames.AckFrame) error {
-	if err := s.sentPacketHandler.ReceivedAck(frame, s.lastRcvdPacketNumber, s.lastNetworkActivityTime); err != nil {
-		return err
-	}
-	return nil
+	return s.sentPacketHandler.ReceivedAck(frame, s.lastRcvdPacketNumber, s.lastNetworkActivityTime)
 }
 
 // Close the connection. If err is nil it will be set to qerr.PeerGoingAway.
@@ -542,7 +540,7 @@ func (s *session) closeImpl(e error, remoteClose bool) error {
 		return nil
 	}
 
-	if quicErr.ErrorCode == qerr.DecryptionFailure {
+	if quicErr.ErrorCode == qerr.DecryptionFailure || quicErr == handshake.ErrHOLExperiment {
 		// If we send a public reset, don't send a CONNECTION_CLOSE
 		s.closeChan <- nil
 		return s.sendPublicReset(s.lastRcvdPacketNumber)
@@ -561,14 +559,6 @@ func (s *session) closeStreamsWithError(err error) {
 func (s *session) sendPacket() error {
 	// Repeatedly try sending until we don't have any more data, or run out of the congestion window
 	for {
-		err := s.sentPacketHandler.CheckForError()
-		if err != nil {
-			return err
-		}
-
-		// Do this before checking the congestion, since we might de-congestionize here :)
-		s.sentPacketHandler.MaybeQueueRTOs()
-
 		if !s.sentPacketHandler.SendingAllowed() {
 			return nil
 		}
@@ -784,12 +774,16 @@ func (s *session) tryQueueingUndecryptablePacket(p *receivedPacket) {
 	if s.cryptoSetup.HandshakeComplete() {
 		return
 	}
-	utils.Infof("Queueing packet 0x%x for later decryption", p.publicHeader.PacketNumber)
-	if len(s.undecryptablePackets)+1 >= protocol.MaxUndecryptablePackets && s.receivedTooManyUndecrytablePacketsTime.IsZero() {
-		s.receivedTooManyUndecrytablePacketsTime = time.Now()
-		s.maybeResetTimer()
+	if len(s.undecryptablePackets)+1 > protocol.MaxUndecryptablePackets {
+		// if this is the first time the undecryptablePackets runs full, start the timer to send a Public Reset
+		if s.receivedTooManyUndecrytablePacketsTime.IsZero() {
+			s.receivedTooManyUndecrytablePacketsTime = time.Now()
+			s.maybeResetTimer()
+		}
+		utils.Infof("Dropping undecrytable packet 0x%x (undecryptable packet queue full)", p.publicHeader.PacketNumber)
 		return
 	}
+	utils.Infof("Queueing packet 0x%x for later decryption", p.publicHeader.PacketNumber)
 	s.undecryptablePackets = append(s.undecryptablePackets, p)
 }
 
@@ -812,6 +806,10 @@ func (s *session) getWindowUpdateFrames() ([]*frames.WindowUpdateFrame, error) {
 func (s *session) ackAlarmChanged(t time.Time) {
 	s.nextAckScheduledTime = t
 	s.maybeResetTimer()
+}
+
+func (s *session) LocalAddr() net.Addr {
+	return s.conn.LocalAddr()
 }
 
 // RemoteAddr returns the net.Addr of the client

@@ -12,7 +12,6 @@
 package proxy
 
 import (
-	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -119,7 +118,7 @@ func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int) *
 			req.URL.Host = target.Host
 		}
 
-		// We should remove the `without` prefix at first.
+		// remove the `without` prefix
 		if without != "" {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, without)
 			if req.URL.Opaque != "" {
@@ -137,6 +136,7 @@ func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int) *
 			}
 			return def
 		}
+
 		// Make up the final URL by concatenating the request and target URL.
 		//
 		// If there is encoded part in request or target URL,
@@ -224,7 +224,10 @@ func (rp *ReverseProxy) UseInsecureTransport() {
 		}
 		rp.Transport = transport
 	} else if transport, ok := rp.Transport.(*http.Transport); ok {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
 		// No http2.ConfigureTransport() here.
 		// For now this is only added in places where
 		// an http.Transport is actually created.
@@ -242,14 +245,6 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 	}
 
 	rp.Director(outreq)
-
-	// Original incoming server request may be canceled by the
-	// user or by std lib(e.g. too many idle connections).
-	// Now we issue the new outgoing client request which
-	// doesn't depend on the original one. (issue 1345)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	outreq = outreq.WithContext(ctx)
 
 	res, err := transport.RoundTrip(outreq)
 	if err != nil {
@@ -441,7 +436,7 @@ func newConnHijackerTransport(base http.RoundTripper) *connHijackerTransport {
 	}
 	if b, _ := base.(*http.Transport); b != nil {
 		tlsClientConfig := b.TLSClientConfig
-		if tlsClientConfig.NextProtos != nil {
+		if tlsClientConfig != nil && tlsClientConfig.NextProtos != nil {
 			tlsClientConfig = tlsClientConfig.Clone()
 			tlsClientConfig.NextProtos = nil
 		}

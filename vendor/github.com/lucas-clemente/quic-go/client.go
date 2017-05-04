@@ -30,8 +30,6 @@ type client struct {
 	session packetHandler
 }
 
-var errHostname = errors.New("Invalid hostname")
-
 var (
 	errCloseSessionForNewVersion = errors.New("closing session in order to recreate it with a new version")
 )
@@ -116,7 +114,8 @@ func (c *client) listen() {
 		var addr net.Addr
 		data := getPacketBuffer()
 		data = data[:protocol.MaxReceivePacketSize]
-
+		// The packet size should not exceed protocol.MaxReceivePacketSize bytes
+		// If it does, we only read a truncated packet, which will then end up undecryptable
 		n, addr, err = c.conn.Read(data)
 		if err != nil {
 			if !strings.HasSuffix(err.Error(), "use of closed network connection") {
@@ -141,19 +140,17 @@ func (c *client) listen() {
 }
 
 func (c *client) handlePacket(remoteAddr net.Addr, packet []byte) error {
-	if protocol.ByteCount(len(packet)) > protocol.MaxReceivePacketSize {
-		return qerr.PacketTooLarge
-	}
-
 	rcvTime := time.Now()
 
 	r := bytes.NewReader(packet)
-
 	hdr, err := ParsePublicHeader(r, protocol.PerspectiveServer)
 	if err != nil {
 		return qerr.Error(qerr.InvalidPacketHeader, err.Error())
 	}
 	hdr.Raw = packet[:len(packet)-r.Len()]
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
 	// ignore delayed / duplicated version negotiation packets
 	if c.connState >= ConnStateVersionNegotiated && hdr.VersionFlag {
@@ -163,58 +160,16 @@ func (c *client) handlePacket(remoteAddr net.Addr, packet []byte) error {
 	// this is the first packet after the client sent a packet with the VersionFlag set
 	// if the server doesn't send a version negotiation packet, it supports the suggested version
 	if !hdr.VersionFlag && c.connState == ConnStateInitial {
-		c.mutex.Lock()
 		c.connState = ConnStateVersionNegotiated
 		c.connStateChangeOrErrCond.Signal()
-		c.mutex.Unlock()
 		if c.config.ConnState != nil {
 			go c.config.ConnState(c.session, ConnStateVersionNegotiated)
 		}
 	}
 
 	if hdr.VersionFlag {
-		var hasCommonVersion bool // check if we're supporting any of the offered versions
-		for _, v := range hdr.SupportedVersions {
-			// check if the server sent the offered version in supported versions
-			if v == c.version {
-				return qerr.Error(qerr.InvalidVersionNegotiationPacket, "Server already supports client's version and should have accepted the connection.")
-			}
-			if v != protocol.VersionUnsupported {
-				hasCommonVersion = true
-			}
-		}
-		if !hasCommonVersion {
-			utils.Infof("No common version found.")
-			return qerr.InvalidVersion
-		}
-
-		ok, highestSupportedVersion := protocol.HighestSupportedVersion(hdr.SupportedVersions)
-		if !ok {
-			return qerr.VersionNegotiationMismatch
-		}
-
-		// switch to negotiated version
-		c.version = highestSupportedVersion
-		c.connState = ConnStateVersionNegotiated
-		c.connectionID, err = utils.GenerateConnectionID()
-		if err != nil {
-			return err
-		}
-		utils.Infof("Switching to QUIC version %d. New connection ID: %x", highestSupportedVersion, c.connectionID)
-
-		c.session.Close(errCloseSessionForNewVersion)
-		err = c.createNewSession(hdr.SupportedVersions)
-		if err != nil {
-			return err
-		}
-		if c.config.ConnState != nil {
-			go c.config.ConnState(c.session, ConnStateVersionNegotiated)
-		}
-		if err != nil {
-			return err
-		}
-
-		return nil // version negotiation packets have no payload
+		// version negotiation packets have no payload
+		return c.handlePacketWithVersionFlag(hdr)
 	}
 
 	c.session.handlePacket(&receivedPacket{
@@ -223,6 +178,43 @@ func (c *client) handlePacket(remoteAddr net.Addr, packet []byte) error {
 		data:         packet[len(packet)-r.Len():],
 		rcvTime:      rcvTime,
 	})
+	return nil
+}
+
+func (c *client) handlePacketWithVersionFlag(hdr *PublicHeader) error {
+	for _, v := range hdr.SupportedVersions {
+		if v == c.version {
+			// the version negotiation packet contains the version that we offered
+			// this might be a packet sent by an attacker (or by a terribly broken server implementation)
+			// ignore it
+			return nil
+		}
+	}
+
+	ok, highestSupportedVersion := protocol.HighestSupportedVersion(hdr.SupportedVersions)
+	if !ok {
+		return qerr.InvalidVersion
+	}
+
+	// switch to negotiated version
+	c.version = highestSupportedVersion
+	c.connState = ConnStateVersionNegotiated
+	var err error
+	c.connectionID, err = utils.GenerateConnectionID()
+	if err != nil {
+		return err
+	}
+	utils.Infof("Switching to QUIC version %d. New connection ID: %x", highestSupportedVersion, c.connectionID)
+
+	c.session.Close(errCloseSessionForNewVersion)
+	err = c.createNewSession(hdr.SupportedVersions)
+	if err != nil {
+		return err
+	}
+	if c.config.ConnState != nil {
+		go c.config.ConnState(c.session, ConnStateVersionNegotiated)
+	}
+
 	return nil
 }
 

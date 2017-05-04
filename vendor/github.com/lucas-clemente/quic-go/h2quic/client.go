@@ -53,6 +53,7 @@ func NewClient(t *QuicRoundTripper, tlsConfig *tls.Config, hostname string) *Cli
 	c.cryptoChangedCond = sync.Cond{L: &c.mutex}
 	c.config = &quic.Config{
 		ConnState: c.connStateCallback,
+		TLSConfig: tlsConfig,
 	}
 	return c
 }
@@ -63,6 +64,8 @@ func (c *Client) Dial() error {
 	return err
 }
 
+// connStateCallback is the ConnStateCallback passed to the quic.Dial
+// this function is called in a separate go-routine
 func (c *Client) connStateCallback(sess quic.Session, state quic.ConnState) {
 	c.mutex.Lock()
 	if c.session == nil {
@@ -75,12 +78,15 @@ func (c *Client) connStateCallback(sess quic.Session, state quic.ConnState) {
 			c.Close(err)
 		}
 	case quic.ConnStateSecure:
-		c.encryptionLevel = protocol.EncryptionSecure
 		utils.Debugf("is secure")
+		// only save the encryption level if it is now higher than it was before
+		if c.encryptionLevel < protocol.EncryptionSecure {
+			c.encryptionLevel = protocol.EncryptionSecure
+		}
 		c.cryptoChangedCond.Broadcast()
 	case quic.ConnStateForwardSecure:
-		c.encryptionLevel = protocol.EncryptionForwardSecure
 		utils.Debugf("is forward secure")
+		c.encryptionLevel = protocol.EncryptionForwardSecure
 		c.cryptoChangedCond.Broadcast()
 	}
 	c.mutex.Unlock()
@@ -110,7 +116,7 @@ func (c *Client) handleHeaderStream() {
 	for {
 		frame, err := h2framer.ReadFrame()
 		if err != nil {
-			c.headerErr = qerr.Error(qerr.InvalidStreamData, "cannot read frame")
+			c.headerErr = qerr.Error(qerr.HeadersStreamDataDecompressFailure, "cannot read frame")
 			break
 		}
 		lastStream = protocol.StreamID(frame.Header().StreamID)
@@ -238,7 +244,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			res.Header.Del("Content-Length")
 			res.ContentLength = -1
 			res.Body = &gzipReader{body: res.Body}
-			setUncompressed(res)
+			res.Uncompressed = true
 		}
 	}
 

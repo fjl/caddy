@@ -161,6 +161,16 @@ func (l *Lexer) Next() (TokenType, []byte) {
 	// ErrorToken, WhitespaceToken and CommentToken are already returned
 	if tt == LineTerminatorToken || tt == PunctuatorToken && regexpStateByte[c] {
 		l.regexpState = true
+	} else if tt == IdentifierToken {
+		switch hash := ToHash(l.r.Lexeme()); hash {
+		case 0, This, False, True, Null:
+			l.regexpState = false
+		default:
+			// This will include keywords that can't be followed by a regexp, but only
+			// by a specified char (like `if` or `try`), but we don't check for syntax
+			// errors as we don't attempt to parse a full JS grammar when streaming
+			l.regexpState = true
+		}
 	} else {
 		l.regexpState = false
 	}

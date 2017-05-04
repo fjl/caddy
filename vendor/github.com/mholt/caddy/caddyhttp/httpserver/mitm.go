@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-
-	"github.com/mholt/caddy"
 )
 
 // tlsHandler is a http.Handler that will inject a value
@@ -74,7 +72,7 @@ func (h *tlsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if checked {
-		r = r.WithContext(context.WithValue(r.Context(), caddy.CtxKey("mitm"), mitm))
+		r = r.WithContext(context.WithValue(r.Context(), MitmCtxKey, mitm))
 	}
 
 	if mitm && h.closeOnMITM {
@@ -135,7 +133,7 @@ func (c *clientHelloConn) Read(b []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-	c.buf = nil // buffer no longer needed
+	bufpool.Put(c.buf) // buffer no longer needed
 
 	// parse the ClientHello and store it in the map
 	rawParsed := parseRawClientHello(hello)
@@ -163,11 +161,11 @@ func parseRawClientHello(data []byte) (info rawHelloInfo) {
 	if len(data) < 42 {
 		return
 	}
-	sessionIdLen := int(data[38])
-	if sessionIdLen > 32 || len(data) < 39+sessionIdLen {
+	sessionIDLen := int(data[38])
+	if sessionIDLen > 32 || len(data) < 39+sessionIDLen {
 		return
 	}
-	data = data[39+sessionIdLen:]
+	data = data[39+sessionIDLen:]
 	if len(data) < 2 {
 		return
 	}
@@ -287,7 +285,9 @@ func (l *tlsHelloListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	helloConn := &clientHelloConn{Conn: conn, listener: l, buf: new(bytes.Buffer)}
+	buf := bufpool.Get().(*bytes.Buffer)
+	buf.Reset()
+	helloConn := &clientHelloConn{Conn: conn, listener: l, buf: buf}
 	return tls.Server(helloConn, l.config), nil
 }
 
@@ -572,6 +572,13 @@ func hasGreaseCiphers(cipherSuites []uint16) bool {
 	return false
 }
 
+// pool buffers so we can reuse allocations over time
+var bufpool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 var greaseCiphers = map[uint16]struct{}{
 	0x0A0A: {},
 	0x1A1A: {},
@@ -591,6 +598,7 @@ var greaseCiphers = map[uint16]struct{}{
 	0xFAFA: {},
 }
 
+// Define variables used for TLS communication
 const (
 	extensionOCSPStatusRequest = 5
 	extensionSupportedCurves   = 10 // also called "SupportedGroups"

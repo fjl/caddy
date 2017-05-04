@@ -2,19 +2,21 @@ package httpserver
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io/ioutil"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
 	"os"
 
-	"github.com/mholt/caddy"
 	"github.com/russross/blackfriday"
 )
 
@@ -27,6 +29,20 @@ type Context struct {
 	Req  *http.Request
 	URL  *url.URL
 	Args []interface{} // defined by arguments to .Include
+
+	// just used for adding preload links for server push
+	responseHeader http.Header
+}
+
+// NewContextWithHeader creates a context with given response header.
+//
+// To plugin developer:
+// The returned context's exported fileds remain empty,
+// you should then initialize them if you want.
+func NewContextWithHeader(rh http.Header) Context {
+	return Context{
+		responseHeader: rh,
+	}
 }
 
 // Include returns the contents of filename relative to the site root.
@@ -60,6 +76,18 @@ func (c Context) Cookie(name string) string {
 // Header gets the value of a request header with field name.
 func (c Context) Header(name string) string {
 	return c.Req.Header.Get(name)
+}
+
+// Hostname gets the (remote) hostname of the client making the request.
+func (c Context) Hostname() string {
+	ip := c.IP()
+
+	hostnameList, err := net.LookupAddr(ip)
+	if err != nil || len(hostnameList) == 0 {
+		return c.Req.RemoteAddr
+	}
+
+	return hostnameList[0]
 }
 
 // Env gets a map of the environment variables.
@@ -260,13 +288,15 @@ func ContextInclude(filename string, ctx interface{}, fs http.FileSystem) (strin
 		return "", err
 	}
 
-	tpl, err := template.New(filename).Parse(string(body))
+	tpl, err := template.New(filename).Funcs(TemplateFuncs).Parse(string(body))
 	if err != nil {
 		return "", err
 	}
 
-	var buf bytes.Buffer
-	err = tpl.Execute(&buf, ctx)
+	buf := includeBufs.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer includeBufs.Put(buf)
+	err = tpl.Execute(buf, ctx)
 	if err != nil {
 		return "", err
 	}
@@ -349,8 +379,67 @@ func (c Context) Files(name string) ([]string, error) {
 // IsMITM returns true if it seems likely that the TLS connection
 // is being intercepted.
 func (c Context) IsMITM() bool {
-	if val, ok := c.Req.Context().Value(caddy.CtxKey("mitm")).(bool); ok {
+	if val, ok := c.Req.Context().Value(MitmCtxKey).(bool); ok {
 		return val
 	}
 	return false
 }
+
+// RandomString generates a random string of random length given
+// length bounds. Thanks to http://stackoverflow.com/a/35615565/1048862
+// for the clever technique that is fairly fast, secure, and maintains
+// proper distributions over the dictionary.
+func (c Context) RandomString(minLen, maxLen int) string {
+	const (
+		letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		letterIdxBits = 6                    // 6 bits to represent 64 possibilities (indexes)
+		letterIdxMask = 1<<letterIdxBits - 1 // all 1-bits, as many as letterIdxBits
+	)
+
+	if minLen < 0 || maxLen < 0 || maxLen < minLen {
+		return ""
+	}
+
+	n := mathrand.Intn(maxLen-minLen+1) + minLen // choose actual length
+
+	// secureRandomBytes returns a number of bytes using crypto/rand.
+	secureRandomBytes := func(numBytes int) []byte {
+		randomBytes := make([]byte, numBytes)
+		rand.Read(randomBytes)
+		return randomBytes
+	}
+
+	result := make([]byte, n)
+	bufferSize := int(float64(n) * 1.3)
+	for i, j, randomBytes := 0, 0, []byte{}; i < n; j++ {
+		if j%bufferSize == 0 {
+			randomBytes = secureRandomBytes(bufferSize)
+		}
+		if idx := int(randomBytes[j%n] & letterIdxMask); idx < len(letterBytes) {
+			result[i] = letterBytes[idx]
+			i++
+		}
+	}
+
+	return string(result)
+}
+
+// Push adds a preload link in response header for server push
+func (c Context) Push(link string) string {
+	if c.responseHeader == nil {
+		return ""
+	}
+	c.responseHeader.Add("Link", "<"+link+">; rel=preload")
+	return ""
+}
+
+// buffer pool for .Include context actions
+var includeBufs = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// TemplateFuncs contains user-defined functions
+// for execution in templates.
+var TemplateFuncs = template.FuncMap{}

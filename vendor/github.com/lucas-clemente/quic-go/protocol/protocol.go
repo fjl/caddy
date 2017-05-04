@@ -1,9 +1,6 @@
 package protocol
 
-import (
-	"math"
-	"time"
-)
+import "math"
 
 // A PacketNumber in QUIC
 type PacketNumber uint64
@@ -36,9 +33,6 @@ type ByteCount uint64
 // MaxByteCount is the maximum value of a ByteCount
 const MaxByteCount = math.MaxUint64
 
-// CryptoStreamID is the ID of the crypto stream
-const CryptoStreamID StreamID = 1
-
 // MaxReceivePacketSize maximum packet size of any QUIC packet, based on
 // ethernet's max size, minus the IP and UDP headers. IPv6 has a 40 byte header,
 // UDP adds an additional 8 bytes.  This is a total overhead of 48 bytes.
@@ -54,15 +48,6 @@ const InitialStreamFlowControlWindow ByteCount = (1 << 14) // 16 kB
 
 // InitialConnectionFlowControlWindow is the initial connection-level flow control window for sending
 const InitialConnectionFlowControlWindow ByteCount = (1 << 14) // 16 kB
-
-// DefaultRetransmissionTime is the RTO time on new connections
-const DefaultRetransmissionTime = 500 * time.Millisecond
-
-// MinRetransmissionTime is the minimum RTO time
-const MinRetransmissionTime = 200 * time.Millisecond
-
-// MaxRetransmissionTime is the maximum RTO time
-const MaxRetransmissionTime = 60 * time.Second
 
 // ClientHelloMinimumSize is the minimum size the server expects an inchoate CHLO to have.
 const ClientHelloMinimumSize = 1024
