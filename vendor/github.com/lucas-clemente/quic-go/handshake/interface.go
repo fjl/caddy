@@ -9,11 +9,15 @@ type Sealer func(dst, src []byte, packetNumber protocol.PacketNumber, associated
 type CryptoSetup interface {
 	Open(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) ([]byte, protocol.EncryptionLevel, error)
 	HandleCryptoStream() error
-	HandshakeComplete() bool
 	// TODO: clean up this interface
-	DiversificationNonce() []byte         // only needed for cryptoSetupServer
-	SetDiversificationNonce([]byte) error // only needed for cryptoSetupClient
+	DiversificationNonce() []byte   // only needed for cryptoSetupServer
+	SetDiversificationNonce([]byte) // only needed for cryptoSetupClient
 
 	GetSealer() (protocol.EncryptionLevel, Sealer)
 	GetSealerWithEncryptionLevel(protocol.EncryptionLevel) (Sealer, error)
+}
+
+// TransportParameters are parameters sent to the peer during the handshake
+type TransportParameters struct {
+	RequestConnectionIDTruncation bool
 }

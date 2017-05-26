@@ -18,7 +18,7 @@ import (
 type packetHandler interface {
 	Session
 	handlePacket(*receivedPacket)
-	run()
+	run() error
 }
 
 // A Listener of QUIC
@@ -34,7 +34,11 @@ type server struct {
 	sessionsMutex             sync.RWMutex
 	deleteClosedSessionsAfter time.Duration
 
-	newSession func(conn connection, v protocol.VersionNumber, connectionID protocol.ConnectionID, sCfg *handshake.ServerConfig, closeCallback closeCallback, cryptoChangeCallback cryptoChangeCallback) (packetHandler, error)
+	serverError  error
+	sessionQueue chan Session
+	errorChan    chan struct{}
+
+	newSession func(conn connection, v protocol.VersionNumber, connectionID protocol.ConnectionID, sCfg *handshake.ServerConfig, config *Config) (packetHandler, <-chan handshakeEvent, error)
 }
 
 var _ Listener = &server{}
@@ -66,19 +70,35 @@ func Listen(conn net.PacketConn, config *Config) (Listener, error) {
 		return nil, err
 	}
 
-	return &server{
+	s := &server{
 		conn:                      conn,
-		config:                    config,
+		config:                    populateServerConfig(config),
 		certChain:                 certChain,
 		scfg:                      scfg,
 		sessions:                  map[protocol.ConnectionID]packetHandler{},
 		newSession:                newSession,
 		deleteClosedSessionsAfter: protocol.ClosedSessionDeleteTimeout,
-	}, nil
+		sessionQueue:              make(chan Session, 5),
+		errorChan:                 make(chan struct{}),
+	}
+	go s.serve()
+	return s, nil
 }
 
-// Listen listens on an existing PacketConn
-func (s *server) Serve() error {
+func populateServerConfig(config *Config) *Config {
+	versions := config.Versions
+	if len(versions) == 0 {
+		versions = protocol.SupportedVersions
+	}
+
+	return &Config{
+		TLSConfig: config.TLSConfig,
+		Versions:  versions,
+	}
+}
+
+// serve listens on an existing PacketConn
+func (s *server) serve() {
 	for {
 		data := getPacketBuffer()
 		data = data[:protocol.MaxReceivePacketSize]
@@ -86,12 +106,26 @@ func (s *server) Serve() error {
 		// If it does, we only read a truncated packet, which will then end up undecryptable
 		n, remoteAddr, err := s.conn.ReadFrom(data)
 		if err != nil {
-			return err
+			s.serverError = err
+			close(s.errorChan)
+			_ = s.Close()
+			return
 		}
 		data = data[:n]
 		if err := s.handlePacket(s.conn, remoteAddr, data); err != nil {
 			utils.Errorf("error handling packet: %s", err.Error())
 		}
+	}
+		}
+
+// Accept returns newly openend sessions
+func (s *server) Accept() (Session, error) {
+	var sess Session
+	select {
+	case sess = <-s.sessionQueue:
+		return sess, nil
+	case <-s.errorChan:
+		return nil, s.serverError
 	}
 }
 
@@ -151,18 +185,18 @@ func (s *server) handlePacket(pconn net.PacketConn, remoteAddr net.Addr, packet 
 	// a session is only created once the client sent a supported version
 	// if we receive a packet for a connection that already has session, it's probably an old packet that was sent by the client before the version was negotiated
 	// it is safe to drop it
-	if ok && hdr.VersionFlag && !protocol.IsSupportedVersion(hdr.VersionNumber) {
+	if ok && hdr.VersionFlag && !protocol.IsSupportedVersion(s.config.Versions, hdr.VersionNumber) {
 		return nil
 	}
 
 	// Send Version Negotiation Packet if the client is speaking a different protocol version
-	if hdr.VersionFlag && !protocol.IsSupportedVersion(hdr.VersionNumber) {
+	if hdr.VersionFlag && !protocol.IsSupportedVersion(s.config.Versions, hdr.VersionNumber) {
 		// drop packets that are too small to be valid first packets
 		if len(packet) < protocol.ClientHelloMinimumSize+len(hdr.Raw) {
 			return errors.New("dropping small packet with unknown version")
 		}
 		utils.Infof("Client offered version %d, sending VersionNegotiationPacket", hdr.VersionNumber)
-		_, err = pconn.WriteTo(composeVersionNegotiation(hdr.ConnectionID), remoteAddr)
+		_, err = pconn.WriteTo(composeVersionNegotiation(hdr.ConnectionID, s.config.Versions), remoteAddr)
 		return err
 	}
 
@@ -172,29 +206,44 @@ func (s *server) handlePacket(pconn net.PacketConn, remoteAddr net.Addr, packet 
 			return err
 		}
 		version := hdr.VersionNumber
-		if !protocol.IsSupportedVersion(version) {
+		if !protocol.IsSupportedVersion(s.config.Versions, version) {
 			return errors.New("Server BUG: negotiated version not supported")
 		}
 
 		utils.Infof("Serving new connection: %x, version %d from %v", hdr.ConnectionID, version, remoteAddr)
-		session, err = s.newSession(
+		var handshakeChan <-chan handshakeEvent
+		session, handshakeChan, err = s.newSession(
 			&conn{pconn: pconn, currentAddr: remoteAddr},
 			version,
 			hdr.ConnectionID,
 			s.scfg,
-			s.closeCallback,
-			s.cryptoChangeCallback,
+			s.config,
 		)
 		if err != nil {
 			return err
 		}
-		go session.run()
 		s.sessionsMutex.Lock()
 		s.sessions[hdr.ConnectionID] = session
 		s.sessionsMutex.Unlock()
-		if s.config.ConnState != nil {
-			go s.config.ConnState(session, ConnStateVersionNegotiated)
-		}
+
+		go func() {
+			// session.run() returns as soon as the session is closed
+			_ = session.run()
+			s.removeConnection(hdr.ConnectionID)
+		}()
+
+		go func() {
+			for {
+				ev := <-handshakeChan
+				if ev.err != nil {
+					return
+				}
+				if ev.encLevel == protocol.EncryptionForwardSecure {
+					break
+				}
+			}
+			s.sessionQueue <- session
+		}()
 	}
 	if session == nil {
 		// Late packet for closed session
@@ -209,19 +258,7 @@ func (s *server) handlePacket(pconn net.PacketConn, remoteAddr net.Addr, packet 
 	return nil
 }
 
-func (s *server) cryptoChangeCallback(session Session, isForwardSecure bool) {
-	var state ConnState
-	if isForwardSecure {
-		state = ConnStateForwardSecure
-	} else {
-		state = ConnStateSecure
-	}
-	if s.config.ConnState != nil {
-		go s.config.ConnState(session, state)
-	}
-}
-
-func (s *server) closeCallback(id protocol.ConnectionID) {
+func (s *server) removeConnection(id protocol.ConnectionID) {
 	s.sessionsMutex.Lock()
 	s.sessions[id] = nil
 	s.sessionsMutex.Unlock()
@@ -233,17 +270,19 @@ func (s *server) closeCallback(id protocol.ConnectionID) {
 	})
 }
 
-func composeVersionNegotiation(connectionID protocol.ConnectionID) []byte {
+func composeVersionNegotiation(connectionID protocol.ConnectionID, versions []protocol.VersionNumber) []byte {
 	fullReply := &bytes.Buffer{}
 	responsePublicHeader := PublicHeader{
 		ConnectionID: connectionID,
 		PacketNumber: 1,
 		VersionFlag:  true,
 	}
-	err := responsePublicHeader.Write(fullReply, protocol.Version35, protocol.PerspectiveServer)
+	err := responsePublicHeader.Write(fullReply, protocol.VersionWhatever, protocol.PerspectiveServer)
 	if err != nil {
 		utils.Errorf("error composing version negotiation packet: %s", err.Error())
 	}
-	fullReply.Write(protocol.SupportedVersionsAsTags)
+	for _, v := range versions {
+		utils.WriteUint32(fullReply, protocol.VersionNumberToTag(v))
+	}
 	return fullReply.Bytes()
 }

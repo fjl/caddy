@@ -24,9 +24,11 @@ type KeyExchangeFunction func() crypto.KeyExchange
 type cryptoSetupServer struct {
 	connID               protocol.ConnectionID
 	sourceAddr           []byte
-	version              protocol.VersionNumber
 	scfg                 *ServerConfig
 	diversificationNonce []byte
+
+	version           protocol.VersionNumber
+	supportedVersions []protocol.VersionNumber
 
 	nullAEAD                    crypto.AEAD
 	secureAEAD                  crypto.AEAD
@@ -34,7 +36,7 @@ type cryptoSetupServer struct {
 	receivedForwardSecurePacket bool
 	sentSHLO                    bool
 	receivedSecurePacket        bool
-	aeadChanged                 chan protocol.EncryptionLevel
+	aeadChanged                 chan<- protocol.EncryptionLevel
 
 	keyDerivation KeyDerivationFunction
 	keyExchange   KeyExchangeFunction
@@ -61,12 +63,14 @@ func NewCryptoSetup(
 	scfg *ServerConfig,
 	cryptoStream io.ReadWriter,
 	connectionParametersManager ConnectionParametersManager,
-	aeadChanged chan protocol.EncryptionLevel,
+	supportedVersions []protocol.VersionNumber,
+	aeadChanged chan<- protocol.EncryptionLevel,
 ) (CryptoSetup, error) {
 	return &cryptoSetupServer{
 		connID:               connID,
 		sourceAddr:           sourceAddr,
 		version:              version,
+		supportedVersions:    supportedVersions,
 		scfg:                 scfg,
 		keyDerivation:        crypto.DeriveKeysAESGCM,
 		keyExchange:          getEphermalKEX,
@@ -81,17 +85,16 @@ func NewCryptoSetup(
 func (h *cryptoSetupServer) HandleCryptoStream() error {
 	for {
 		var chloData bytes.Buffer
-		messageTag, cryptoData, err := ParseHandshakeMessage(io.TeeReader(h.cryptoStream, &chloData))
+		message, err := ParseHandshakeMessage(io.TeeReader(h.cryptoStream, &chloData))
 		if err != nil {
 			return qerr.HandshakeFailed
 		}
-		if messageTag != TagCHLO {
+		if message.Tag != TagCHLO {
 			return qerr.InvalidCryptoMessageType
 		}
 
-		utils.Debugf("Got CHLO:\n%s", printHandshakeMessage(cryptoData))
-
-		done, err := h.handleMessage(chloData.Bytes(), cryptoData)
+		utils.Debugf("Got %s", message)
+		done, err := h.handleMessage(chloData.Bytes(), message.Data)
 		if err != nil {
 			return err
 		}
@@ -127,7 +130,7 @@ func (h *cryptoSetupServer) handleMessage(chloData []byte, cryptoData map[Tag][]
 	verTag := binary.LittleEndian.Uint32(verSlice)
 	ver := protocol.VersionTagToNumber(verTag)
 	// If the client's preferred version is not the version we are currently speaking, then the client went through a version negotiation.  In this case, we need to make sure that we actually do not support this version and that it wasn't a downgrade attack.
-	if ver != h.version && protocol.IsSupportedVersion(ver) {
+	if ver != h.version && protocol.IsSupportedVersion(h.supportedVersions, ver) {
 		return false, qerr.Error(qerr.VersionNegotiationMismatch, "Downgrade attack detected")
 	}
 
@@ -169,7 +172,10 @@ func (h *cryptoSetupServer) Open(dst, src []byte, packetNumber protocol.PacketNu
 	if h.forwardSecureAEAD != nil {
 		res, err := h.forwardSecureAEAD.Open(dst, src, packetNumber, associatedData)
 		if err == nil {
-			h.receivedForwardSecurePacket = true
+			if !h.receivedForwardSecurePacket { // this is the first forward secure packet we receive from the client
+				h.receivedForwardSecurePacket = true
+				close(h.aeadChanged)
+			}
 			return res, protocol.EncryptionForwardSecure, nil
 		}
 		if h.receivedForwardSecurePacket {
@@ -208,6 +214,9 @@ func (h *cryptoSetupServer) GetSealer() (protocol.EncryptionLevel, Sealer) {
 }
 
 func (h *cryptoSetupServer) GetSealerWithEncryptionLevel(encLevel protocol.EncryptionLevel) (Sealer, error) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
 	switch encLevel {
 	case protocol.EncryptionUnencrypted:
 		return h.sealUnencrypted, nil
@@ -295,9 +304,14 @@ func (h *cryptoSetupServer) handleInchoateCHLO(sni string, chlo []byte, cryptoDa
 		replyMap[TagCERT] = certCompressed
 	}
 
+	message := HandshakeMessage{
+		Tag:  TagREJ,
+		Data: replyMap,
+	}
+
 	var serverReply bytes.Buffer
-	WriteHandshakeMessage(&serverReply, TagREJ, replyMap)
-	utils.Debugf("Sending REJ:\n%s", printHandshakeMessage(replyMap))
+	message.Write(&serverReply)
+	utils.Debugf("Sending %s", message)
 	return serverReply.Bytes(), nil
 }
 
@@ -394,14 +408,22 @@ func (h *cryptoSetupServer) handleCHLO(sni string, data []byte, cryptoData map[T
 		return nil, err
 	}
 	// add crypto parameters
+	verTag := &bytes.Buffer{}
+	for _, v := range h.supportedVersions {
+		utils.WriteUint32(verTag, protocol.VersionNumberToTag(v))
+	}
 	replyMap[TagPUBS] = ephermalKex.PublicKey()
 	replyMap[TagSNO] = serverNonce
-	replyMap[TagVER] = protocol.SupportedVersionsAsTags
+	replyMap[TagVER] = verTag.Bytes()
 
 	// note that the SHLO *has* to fit into one packet
+	message := HandshakeMessage{
+		Tag:  TagSHLO,
+		Data: replyMap,
+	}
 	var reply bytes.Buffer
-	WriteHandshakeMessage(&reply, TagSHLO, replyMap)
-	utils.Debugf("Sending SHLO:\n%s", printHandshakeMessage(replyMap))
+	message.Write(&reply)
+	utils.Debugf("Sending %s", message)
 
 	h.aeadChanged <- protocol.EncryptionForwardSecure
 
@@ -413,13 +435,8 @@ func (h *cryptoSetupServer) DiversificationNonce() []byte {
 	return h.diversificationNonce
 }
 
-func (h *cryptoSetupServer) SetDiversificationNonce(data []byte) error {
+func (h *cryptoSetupServer) SetDiversificationNonce(data []byte) {
 	panic("not needed for cryptoSetupServer")
-}
-
-// HandshakeComplete returns true after the first forward secure packet was received form the client.
-func (h *cryptoSetupServer) HandshakeComplete() bool {
-	return h.receivedForwardSecurePacket
 }
 
 func (h *cryptoSetupServer) validateClientNonce(nonce []byte) error {

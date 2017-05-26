@@ -436,7 +436,7 @@ var directives = []string{
 	"root",
 	"index",
 	"bind",
-	"maxrequestbody", // TODO: 'limits'
+	"limits",
 	"timeouts",
 	"tls",
 
@@ -468,6 +468,7 @@ var directives = []string{
 	"status",
 	"cors", // github.com/captncraig/cors/caddy
 	"mime",
+	"login",     // github.com/tarent/loginsrv/caddy
 	"jwt",       // github.com/BTBurke/caddy-jwt
 	"jsonp",     // github.com/pschlump/caddy-jsonp
 	"upload",    // blitznote.com/src/caddy.upload
@@ -476,6 +477,7 @@ var directives = []string{
 	"pprof",
 	"expvar",
 	"push",
+	"datadog",    // github.com/payintech/caddy-datadog
 	"prometheus", // github.com/miekg/caddy-prometheus
 	"proxy",
 	"fastcgi",
