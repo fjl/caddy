@@ -9,9 +9,9 @@ import (
 
 	"github.com/lucas-clemente/quic-go/crypto"
 	"github.com/lucas-clemente/quic-go/handshake"
+	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/protocol"
 	"github.com/lucas-clemente/quic-go/qerr"
-	"github.com/lucas-clemente/quic-go/utils"
 )
 
 // packetHandler handles packets
@@ -85,15 +85,54 @@ func Listen(conn net.PacketConn, config *Config) (Listener, error) {
 	return s, nil
 }
 
+var defaultAcceptSTK = func(clientAddr net.Addr, stk *STK) bool {
+	if stk == nil {
+		return false
+	}
+	if time.Now().After(stk.sentTime.Add(protocol.STKExpiryTime)) {
+		return false
+	}
+	var sourceAddr string
+	if udpAddr, ok := clientAddr.(*net.UDPAddr); ok {
+		sourceAddr = udpAddr.IP.String()
+	} else {
+		sourceAddr = clientAddr.String()
+	}
+	return sourceAddr == stk.remoteAddr
+}
+
 func populateServerConfig(config *Config) *Config {
 	versions := config.Versions
 	if len(versions) == 0 {
 		versions = protocol.SupportedVersions
 	}
 
+	vsa := defaultAcceptSTK
+	if config.AcceptSTK != nil {
+		vsa = config.AcceptSTK
+	}
+
+	handshakeTimeout := protocol.DefaultHandshakeTimeout
+	if config.HandshakeTimeout != 0 {
+		handshakeTimeout = config.HandshakeTimeout
+	}
+
+	maxReceiveStreamFlowControlWindow := config.MaxReceiveStreamFlowControlWindow
+	if maxReceiveStreamFlowControlWindow == 0 {
+		maxReceiveStreamFlowControlWindow = protocol.DefaultMaxReceiveStreamFlowControlWindowServer
+	}
+	maxReceiveConnectionFlowControlWindow := config.MaxReceiveConnectionFlowControlWindow
+	if maxReceiveConnectionFlowControlWindow == 0 {
+		maxReceiveConnectionFlowControlWindow = protocol.DefaultMaxReceiveConnectionFlowControlWindowServer
+	}
+
 	return &Config{
-		TLSConfig: config.TLSConfig,
-		Versions:  versions,
+		TLSConfig:                             config.TLSConfig,
+		Versions:                              versions,
+		HandshakeTimeout:                      handshakeTimeout,
+		AcceptSTK:                             vsa,
+		MaxReceiveStreamFlowControlWindow:     maxReceiveStreamFlowControlWindow,
+		MaxReceiveConnectionFlowControlWindow: maxReceiveConnectionFlowControlWindow,
 	}
 }
 
@@ -116,7 +155,7 @@ func (s *server) serve() {
 			utils.Errorf("error handling packet: %s", err.Error())
 		}
 	}
-		}
+}
 
 // Accept returns newly openend sessions
 func (s *server) Accept() (Session, error) {

@@ -7,8 +7,8 @@ import (
 
 	"github.com/lucas-clemente/quic-go/flowcontrol"
 	"github.com/lucas-clemente/quic-go/frames"
+	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/protocol"
-	"github.com/lucas-clemente/quic-go/utils"
 )
 
 // A Stream assembles the data from StreamFrames and provides a super-convenient Read-Interface
@@ -52,7 +52,10 @@ type stream struct {
 }
 
 // newStream creates a new Stream
-func newStream(StreamID protocol.StreamID, onData func(), onReset func(protocol.StreamID, protocol.ByteCount), flowControlManager flowcontrol.FlowControlManager) (*stream, error) {
+func newStream(StreamID protocol.StreamID,
+	onData func(),
+	onReset func(protocol.StreamID, protocol.ByteCount),
+	flowControlManager flowcontrol.FlowControlManager) *stream {
 	s := &stream{
 		onData:             onData,
 		onReset:            onReset,
@@ -60,11 +63,9 @@ func newStream(StreamID protocol.StreamID, onData func(), onReset func(protocol.
 		flowControlManager: flowControlManager,
 		frameQueue:         newStreamFrameSorter(),
 	}
-
 	s.newFrameOrErrCond.L = &s.mutex
 	s.doneWritingOrErrCond.L = &s.mutex
-
-	return s, nil
+	return s
 }
 
 // Read implements io.Reader. It is not thread safe!
@@ -170,7 +171,7 @@ func (s *stream) Write(p []byte) (int, error) {
 	}
 
 	if s.err != nil {
-		return 0, s.err
+		return len(p) - len(s.dataForWriting), s.err
 	}
 
 	return len(p), nil

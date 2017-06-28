@@ -443,6 +443,7 @@ var directives = []string{
 	// services/utilities, or other directives that don't necessarily inject handlers
 	"startup",
 	"shutdown",
+	"requestid",
 	"realip", // github.com/captncraig/caddy-realip
 	"git",    // github.com/abiosoft/caddy-git
 
@@ -457,6 +458,7 @@ var directives = []string{
 	"gzip",
 	"header",
 	"errors",
+	"authz",     // github.com/casbin/caddy-authz
 	"filter",    // github.com/echocat/caddy-filter
 	"minify",    // github.com/hacdias/caddy-minify
 	"ipfilter",  // github.com/pyed/ipfilter
@@ -469,6 +471,7 @@ var directives = []string{
 	"cors", // github.com/captncraig/cors/caddy
 	"mime",
 	"login",     // github.com/tarent/loginsrv/caddy
+	"reauth",    // github.com/freman/caddy-reauth
 	"jwt",       // github.com/BTBurke/caddy-jwt
 	"jsonp",     // github.com/pschlump/caddy-jsonp
 	"upload",    // blitznote.com/src/caddy.upload
@@ -490,6 +493,9 @@ var directives = []string{
 	"hugo",      // github.com/hacdias/caddy-hugo
 	"mailout",   // github.com/SchumacherFM/mailout
 	"awslambda", // github.com/coopernurse/caddy-awslambda
+	"grpc",      // github.com/pieterlouw/caddy-grpc
+	"gopkg",     // github.com/zikes/gopkg
+	"restic",    // github.com/mholt/caddy-restic
 }
 
 const (

@@ -331,7 +331,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c := context.WithValue(r.Context(), OriginalURLCtxKey, urlCopy)
 	r = r.WithContext(c)
 
-	w.Header().Set("Server", "Caddy")
+	w.Header().Set("Server", caddy.AppName)
 
 	status, _ := s.serveHTTP(w, r)
 
@@ -352,6 +352,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 
 	// look up the virtualhost; if no match, serve error
 	vhost, pathPrefix := s.vhosts.Match(hostname + r.URL.Path)
+	c := context.WithValue(r.Context(), caddy.CtxKey("path_prefix"), pathPrefix)
+	r = r.WithContext(c)
 
 	if vhost == nil {
 		// check for ACME challenge even if vhost is nil;

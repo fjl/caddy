@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/protocol"
 	"github.com/lucas-clemente/quic-go/qerr"
-	"github.com/lucas-clemente/quic-go/utils"
 )
 
 type client struct {
@@ -73,9 +73,16 @@ func DialNonFWSecure(pconn net.PacketConn, remoteAddr net.Addr, host string, con
 		return nil, err
 	}
 
-	hostname, _, err := net.SplitHostPort(host)
-	if err != nil {
-		return nil, err
+	var hostname string
+	if config.TLSConfig != nil {
+		hostname = config.TLSConfig.ServerName
+	}
+
+	if hostname == "" {
+		hostname, _, err = net.SplitHostPort(host)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	clientConfig := populateClientConfig(config)
@@ -93,7 +100,7 @@ func DialNonFWSecure(pconn net.PacketConn, remoteAddr net.Addr, host string, con
 		return nil, err
 	}
 
-	utils.Infof("Starting new connection to %s (%s), connectionID %x, version %d", hostname, c.conn.RemoteAddr().String(), c.connectionID, c.version)
+	utils.Infof("Starting new connection to %s (%s -> %s), connectionID %x, version %d", hostname, c.conn.LocalAddr().String(), c.conn.RemoteAddr().String(), c.connectionID, c.version)
 
 	return c.session.(NonFWSession), c.establishSecureConnection()
 }
@@ -118,10 +125,27 @@ func populateClientConfig(config *Config) *Config {
 		versions = protocol.SupportedVersions
 	}
 
+	handshakeTimeout := protocol.DefaultHandshakeTimeout
+	if config.HandshakeTimeout != 0 {
+		handshakeTimeout = config.HandshakeTimeout
+	}
+
+	maxReceiveStreamFlowControlWindow := config.MaxReceiveStreamFlowControlWindow
+	if maxReceiveStreamFlowControlWindow == 0 {
+		maxReceiveStreamFlowControlWindow = protocol.DefaultMaxReceiveStreamFlowControlWindowClient
+	}
+	maxReceiveConnectionFlowControlWindow := config.MaxReceiveConnectionFlowControlWindow
+	if maxReceiveConnectionFlowControlWindow == 0 {
+		maxReceiveConnectionFlowControlWindow = protocol.DefaultMaxReceiveConnectionFlowControlWindowClient
+	}
+
 	return &Config{
-		TLSConfig:                     config.TLSConfig,
-		Versions:                      versions,
-		RequestConnectionIDTruncation: config.RequestConnectionIDTruncation,
+		TLSConfig:                             config.TLSConfig,
+		Versions:                              versions,
+		HandshakeTimeout:                      handshakeTimeout,
+		RequestConnectionIDTruncation:         config.RequestConnectionIDTruncation,
+		MaxReceiveStreamFlowControlWindow:     maxReceiveStreamFlowControlWindow,
+		MaxReceiveConnectionFlowControlWindow: maxReceiveConnectionFlowControlWindow,
 	}
 }
 

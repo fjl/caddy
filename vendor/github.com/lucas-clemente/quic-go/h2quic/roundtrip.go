@@ -11,13 +11,8 @@ import (
 	"golang.org/x/net/lex/httplex"
 )
 
-type h2quicClient interface {
-	Dial() error
-	Do(*http.Request) (*http.Response, error)
-}
-
-// QuicRoundTripper implements the http.RoundTripper interface
-type QuicRoundTripper struct {
+// RoundTripper implements the http.RoundTripper interface
+type RoundTripper struct {
 	mutex sync.Mutex
 
 	// DisableCompression, if true, prevents the Transport from
@@ -34,13 +29,13 @@ type QuicRoundTripper struct {
 	// tls.Client. If nil, the default configuration is used.
 	TLSClientConfig *tls.Config
 
-	clients map[string]h2quicClient
+	clients map[string]http.RoundTripper
 }
 
-var _ http.RoundTripper = &QuicRoundTripper{}
+var _ http.RoundTripper = &RoundTripper{}
 
 // RoundTrip does a round trip
-func (r *QuicRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+func (r *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL == nil {
 		closeRequestBody(req)
 		return nil, errors.New("quic: nil Request.URL")
@@ -76,35 +71,23 @@ func (r *QuicRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	hostname := authorityAddr("https", hostnameFromRequest(req))
-	client, err := r.getClient(hostname)
-	if err != nil {
-		return nil, err
-	}
-	return client.Do(req)
+	return r.getClient(hostname).RoundTrip(req)
 }
 
-func (r *QuicRoundTripper) getClient(hostname string) (h2quicClient, error) {
+func (r *RoundTripper) getClient(hostname string) http.RoundTripper {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	if r.clients == nil {
-		r.clients = make(map[string]h2quicClient)
+		r.clients = make(map[string]http.RoundTripper)
 	}
 
 	client, ok := r.clients[hostname]
 	if !ok {
-		client = NewClient(r, r.TLSClientConfig, hostname)
-		err := client.Dial()
-		if err != nil {
-			return nil, err
-		}
+		client = newClient(r.TLSClientConfig, hostname, &roundTripperOpts{DisableCompression: r.DisableCompression})
 		r.clients[hostname] = client
 	}
-	return client, nil
-}
-
-func (r *QuicRoundTripper) disableCompression() bool {
-	return r.DisableCompression
+	return client
 }
 
 func closeRequestBody(req *http.Request) {

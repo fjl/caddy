@@ -6,12 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"sync"
 
 	"github.com/lucas-clemente/quic-go/crypto"
+	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/protocol"
 	"github.com/lucas-clemente/quic-go/qerr"
-	"github.com/lucas-clemente/quic-go/utils"
 )
 
 // KeyDerivationFunction is used for key derivation
@@ -23,12 +24,15 @@ type KeyExchangeFunction func() crypto.KeyExchange
 // The CryptoSetupServer handles all things crypto for the Session
 type cryptoSetupServer struct {
 	connID               protocol.ConnectionID
-	sourceAddr           []byte
+	remoteAddr           net.Addr
 	scfg                 *ServerConfig
+	stkGenerator         *STKGenerator
 	diversificationNonce []byte
 
 	version           protocol.VersionNumber
 	supportedVersions []protocol.VersionNumber
+
+	acceptSTKCallback func(net.Addr, *STK) bool
 
 	nullAEAD                    crypto.AEAD
 	secureAEAD                  crypto.AEAD
@@ -58,25 +62,33 @@ var ErrHOLExperiment = qerr.Error(qerr.InvalidCryptoMessageParameter, "HOL exper
 // NewCryptoSetup creates a new CryptoSetup instance for a server
 func NewCryptoSetup(
 	connID protocol.ConnectionID,
-	sourceAddr []byte,
+	remoteAddr net.Addr,
 	version protocol.VersionNumber,
 	scfg *ServerConfig,
 	cryptoStream io.ReadWriter,
 	connectionParametersManager ConnectionParametersManager,
 	supportedVersions []protocol.VersionNumber,
+	acceptSTK func(net.Addr, *STK) bool,
 	aeadChanged chan<- protocol.EncryptionLevel,
 ) (CryptoSetup, error) {
+	stkGenerator, err := NewSTKGenerator()
+	if err != nil {
+		return nil, err
+	}
+
 	return &cryptoSetupServer{
 		connID:               connID,
-		sourceAddr:           sourceAddr,
+		remoteAddr:           remoteAddr,
 		version:              version,
 		supportedVersions:    supportedVersions,
 		scfg:                 scfg,
+		stkGenerator:         stkGenerator,
 		keyDerivation:        crypto.DeriveKeysAESGCM,
 		keyExchange:          getEphermalKEX,
 		nullAEAD:             crypto.NewNullAEAD(protocol.PerspectiveServer, version),
 		cryptoStream:         cryptoStream,
 		connectionParameters: connectionParametersManager,
+		acceptSTKCallback:    acceptSTK,
 		aeadChanged:          aeadChanged,
 	}, nil
 }
@@ -202,12 +214,16 @@ func (h *cryptoSetupServer) Open(dst, src []byte, packetNumber protocol.PacketNu
 func (h *cryptoSetupServer) GetSealer() (protocol.EncryptionLevel, Sealer) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
-
-	if h.forwardSecureAEAD != nil && h.sentSHLO {
+	if h.forwardSecureAEAD != nil {
 		return protocol.EncryptionForwardSecure, h.sealForwardSecure
-	} else if h.secureAEAD != nil {
-		// secureAEAD and forwardSecureAEAD are created at the same time (when receiving the CHLO)
-		// make sure that the SHLO isn't sent forward-secure
+	}
+	return protocol.EncryptionUnencrypted, h.sealUnencrypted
+}
+
+func (h *cryptoSetupServer) GetSealerForCryptoStream() (protocol.EncryptionLevel, Sealer) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	if h.secureAEAD != nil {
 		return protocol.EncryptionSecure, h.sealSecure
 	}
 	return protocol.EncryptionUnencrypted, h.sealUnencrypted
@@ -239,7 +255,6 @@ func (h *cryptoSetupServer) sealUnencrypted(dst, src []byte, packetNumber protoc
 }
 
 func (h *cryptoSetupServer) sealSecure(dst, src []byte, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
-	h.sentSHLO = true
 	return h.secureAEAD.Seal(dst, src, packetNumber, associatedData)
 }
 
@@ -263,11 +278,16 @@ func (h *cryptoSetupServer) isInchoateCHLO(cryptoData map[Tag][]byte, cert []byt
 	if crypto.HashCert(cert) != xlct {
 		return true
 	}
-	if err := h.scfg.stkSource.VerifyToken(h.sourceAddr, cryptoData[TagSTK]); err != nil {
+	return !h.acceptSTK(cryptoData[TagSTK])
+}
+
+func (h *cryptoSetupServer) acceptSTK(token []byte) bool {
+	stk, err := h.stkGenerator.DecodeToken(token)
+	if err != nil {
 		utils.Debugf("STK invalid: %s", err.Error())
-		return true
+		return false
 	}
-	return false
+	return h.acceptSTKCallback(h.remoteAddr, stk)
 }
 
 func (h *cryptoSetupServer) handleInchoateCHLO(sni string, chlo []byte, cryptoData map[Tag][]byte) ([]byte, error) {
@@ -275,7 +295,7 @@ func (h *cryptoSetupServer) handleInchoateCHLO(sni string, chlo []byte, cryptoDa
 		return nil, qerr.Error(qerr.CryptoInvalidValueLength, "CHLO too small")
 	}
 
-	token, err := h.scfg.stkSource.NewToken(h.sourceAddr)
+	token, err := h.stkGenerator.NewToken(h.remoteAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +306,7 @@ func (h *cryptoSetupServer) handleInchoateCHLO(sni string, chlo []byte, cryptoDa
 		TagSVID: []byte("quic-go"),
 	}
 
-	if h.scfg.stkSource.VerifyToken(h.sourceAddr, cryptoData[TagSTK]) == nil {
+	if h.acceptSTK(cryptoData[TagSTK]) {
 		proof, err := h.scfg.Sign(sni, chlo)
 		if err != nil {
 			return nil, err
