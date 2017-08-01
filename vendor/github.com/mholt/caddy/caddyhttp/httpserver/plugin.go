@@ -443,7 +443,7 @@ var directives = []string{
 	// services/utilities, or other directives that don't necessarily inject handlers
 	"startup",
 	"shutdown",
-	"requestid",
+	"request_id",
 	"realip", // github.com/captncraig/caddy-realip
 	"git",    // github.com/abiosoft/caddy-git
 
@@ -453,6 +453,7 @@ var directives = []string{
 	// directives that add middleware to the stack
 	"locale", // github.com/simia-tech/caddy-locale
 	"log",
+	"cache", // github.com/nicolasazrak/caddy-cache
 	"rewrite",
 	"ext",
 	"gzip",
@@ -468,7 +469,8 @@ var directives = []string{
 	"basicauth",
 	"redir",
 	"status",
-	"cors", // github.com/captncraig/cors/caddy
+	"cors",   // github.com/captncraig/cors/caddy
+	"nobots", // github.com/Xumeiquer/nobots
 	"mime",
 	"login",     // github.com/tarent/loginsrv/caddy
 	"reauth",    // github.com/freman/caddy-reauth
@@ -486,16 +488,17 @@ var directives = []string{
 	"fastcgi",
 	"cgi", // github.com/jung-kurt/caddy-cgi
 	"websocket",
-	"filemanager", // github.com/hacdias/caddy-filemanager
+	"filemanager", // github.com/hacdias/filemanager/caddy/filemanager
+	"webdav",      // github.com/hacdias/caddy-webdav
 	"markdown",
 	"templates",
 	"browse",
-	"hugo",      // github.com/hacdias/caddy-hugo
+	"hugo",      // github.com/hacdias/filemanager/caddy/hugo
 	"mailout",   // github.com/SchumacherFM/mailout
 	"awslambda", // github.com/coopernurse/caddy-awslambda
 	"grpc",      // github.com/pieterlouw/caddy-grpc
 	"gopkg",     // github.com/zikes/gopkg
-	"restic",    // github.com/mholt/caddy-restic
+	"restic",    // github.com/restic/caddy
 }
 
 const (

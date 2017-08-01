@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -53,6 +54,7 @@ type session struct {
 	connectionID protocol.ConnectionID
 	perspective  protocol.Perspective
 	version      protocol.VersionNumber
+	tlsConf      *tls.Config
 	config       *Config
 
 	conn connection
@@ -109,6 +111,9 @@ type session struct {
 	lastNetworkActivityTime time.Time
 
 	timer *utils.Timer
+	// keepAlivePingSent stores whether a Ping frame was sent to the peer or not
+	// it is reset as soon as we receive a packet from the peer
+	keepAlivePingSent bool
 }
 
 var _ Session = &session{}
@@ -119,6 +124,7 @@ func newSession(
 	v protocol.VersionNumber,
 	connectionID protocol.ConnectionID,
 	sCfg *handshake.ServerConfig,
+	tlsConf *tls.Config,
 	config *Config,
 ) (packetHandler, <-chan handshakeEvent, error) {
 	s := &session{
@@ -137,6 +143,7 @@ var newClientSession = func(
 	hostname string,
 	v protocol.VersionNumber,
 	connectionID protocol.ConnectionID,
+	tlsConf *tls.Config,
 	config *Config,
 	negotiatedVersions []protocol.VersionNumber,
 ) (packetHandler, <-chan handshakeEvent, error) {
@@ -145,6 +152,7 @@ var newClientSession = func(
 		connectionID: connectionID,
 		perspective:  protocol.PerspectiveClient,
 		version:      v,
+		tlsConf:      tlsConf,
 		config:       config,
 	}
 	return s.setup(nil, hostname, negotiatedVersions)
@@ -209,7 +217,7 @@ func (s *session) setup(
 			s.connectionID,
 			s.version,
 			cryptoStream,
-			s.config.TLSConfig,
+			s.tlsConf,
 			s.connectionParameters,
 			aeadChanged,
 			&handshake.TransportParameters{RequestConnectionIDTruncation: s.config.RequestConnectionIDTruncation},
@@ -297,6 +305,12 @@ runLoop:
 			s.sentPacketHandler.OnAlarm()
 		}
 
+		if s.config.KeepAlive && s.handshakeComplete && time.Since(s.lastNetworkActivityTime) >= s.idleTimeout()/2 {
+			// send the PING frame since there is no activity in the session
+			s.packer.QueueControlFrame(&frames.PingFrame{})
+			s.keepAlivePingSent = true
+		}
+
 		if err := s.sendPacket(); err != nil {
 			s.closeLocal(err)
 		}
@@ -328,7 +342,12 @@ func (s *session) WaitUntilClosed() {
 }
 
 func (s *session) maybeResetTimer() {
-	deadline := s.lastNetworkActivityTime.Add(s.idleTimeout())
+	var deadline time.Time
+	if s.config.KeepAlive && s.handshakeComplete && !s.keepAlivePingSent {
+		deadline = s.lastNetworkActivityTime.Add(s.idleTimeout() / 2)
+	} else {
+		deadline = s.lastNetworkActivityTime.Add(s.idleTimeout())
+	}
 
 	if ackAlarm := s.receivedPacketHandler.GetAlarmTimeout(); !ackAlarm.IsZero() {
 		deadline = utils.MinTime(deadline, ackAlarm)
@@ -368,6 +387,7 @@ func (s *session) handlePacketImpl(p *receivedPacket) error {
 	}
 
 	s.lastNetworkActivityTime = p.rcvTime
+	s.keepAlivePingSent = false
 	hdr := p.publicHeader
 	data := p.data
 
@@ -421,7 +441,7 @@ func (s *session) handleFrames(fs []frames.Frame) error {
 		case *frames.AckFrame:
 			err = s.handleAckFrame(frame)
 		case *frames.ConnectionCloseFrame:
-			s.close(qerr.Error(frame.ErrorCode, frame.ReasonPhrase), true)
+			s.closeRemote(qerr.Error(frame.ErrorCode, frame.ReasonPhrase))
 		case *frames.GoawayFrame:
 			err = errors.New("unimplemented: handling GOAWAY frames")
 		case *frames.StopWaitingFrame:
@@ -507,20 +527,22 @@ func (s *session) handleAckFrame(frame *frames.AckFrame) error {
 	return s.sentPacketHandler.ReceivedAck(frame, s.lastRcvdPacketNumber, s.lastNetworkActivityTime)
 }
 
-func (s *session) close(e error, remoteClose bool) {
+func (s *session) closeLocal(e error) {
 	s.closeOnce.Do(func() {
-		s.closeChan <- closeError{err: e, remote: remoteClose}
+		s.closeChan <- closeError{err: e, remote: false}
 	})
 }
 
-func (s *session) closeLocal(e error) {
-	s.close(e, false)
+func (s *session) closeRemote(e error) {
+	s.closeOnce.Do(func() {
+		s.closeChan <- closeError{err: e, remote: true}
+	})
 }
 
 // Close the connection. If err is nil it will be set to qerr.PeerGoingAway.
 // It waits until the run loop has stopped before returning
 func (s *session) Close(e error) error {
-	s.close(e, false)
+	s.closeLocal(e)
 	<-s.runClosed
 	return nil
 }
@@ -658,6 +680,7 @@ func (s *session) sendPacket() error {
 }
 
 func (s *session) sendPackedPacket(packet *packedPacket) error {
+	defer putPacketBuffer(packet.raw)
 	err := s.sentPacketHandler.SentPacket(&ackhandler.Packet{
 		PacketNumber:    packet.number,
 		Frames:          packet.frames,
@@ -667,12 +690,8 @@ func (s *session) sendPackedPacket(packet *packedPacket) error {
 	if err != nil {
 		return err
 	}
-
 	s.logPacket(packet)
-
-	err = s.conn.Write(packet.raw)
-	putPacketBuffer(packet.raw)
-	return err
+	return s.conn.Write(packet.raw)
 }
 
 func (s *session) sendConnectionClose(quicErr *qerr.QuicError) error {
@@ -684,9 +703,6 @@ func (s *session) sendConnectionClose(quicErr *qerr.QuicError) error {
 	if err != nil {
 		return err
 	}
-	if packet == nil {
-		return errors.New("Session BUG: expected packet not to be nil")
-	}
 	s.logPacket(packet)
 	return s.conn.Write(packet.raw)
 }
@@ -696,11 +712,9 @@ func (s *session) logPacket(packet *packedPacket) {
 		// We don't need to allocate the slices for calling the format functions
 		return
 	}
-	if utils.Debug() {
-		utils.Debugf("-> Sending packet 0x%x (%d bytes) for connection %x, %s", packet.number, len(packet.raw), s.connectionID, packet.encryptionLevel)
-		for _, frame := range packet.frames {
-			frames.LogFrame(frame, true)
-		}
+	utils.Debugf("-> Sending packet 0x%x (%d bytes) for connection %x, %s", packet.number, len(packet.raw), s.connectionID, packet.encryptionLevel)
+	for _, frame := range packet.frames {
+		frames.LogFrame(frame, true)
 	}
 }
 

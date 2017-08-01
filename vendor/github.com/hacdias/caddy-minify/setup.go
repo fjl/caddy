@@ -35,9 +35,9 @@ func setup(c *caddy.Controller) error {
 	paths := []string{}
 
 	minifiers := map[string]minify.Minifier{
-		"css":  &css.Minifier{},
+		"css":  &css.Minifier{Decimals: -1},
+		"svg":  &svg.Minifier{Decimals: -1},
 		"html": &html.Minifier{},
-		"svg":  &svg.Minifier{},
 		"json": &json.Minifier{},
 		"xml":  &xml.Minifier{},
 		"js":   &js.Minifier{},
@@ -139,6 +139,8 @@ func setup(c *caddy.Controller) error {
 				}
 
 				switch option {
+				case "keep_conditional_comments":
+					minifiers["html"].(*html.Minifier).KeepConditionalComments = val
 				case "keep_default_attr_vals":
 					minifiers["html"].(*html.Minifier).KeepDefaultAttrVals = val
 				case "keep_document_tags":

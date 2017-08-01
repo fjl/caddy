@@ -57,6 +57,16 @@ func makeTLSConfig(group []*SiteConfig) (*tls.Config, error) {
 	return caddytls.MakeTLSConfig(tlsConfigs)
 }
 
+func getFallbacks(sites []*SiteConfig) []string {
+	fallbacks := []string{}
+	for _, sc := range sites {
+		if sc.FallbackSite {
+			fallbacks = append(fallbacks, sc.Addr.Host)
+		}
+	}
+	return fallbacks
+}
+
 // NewServer creates a new Server instance that will listen on addr
 // and will serve the sites configured in group.
 func NewServer(addr string, group []*SiteConfig) (*Server, error) {
@@ -66,6 +76,7 @@ func NewServer(addr string, group []*SiteConfig) (*Server, error) {
 		sites:       group,
 		connTimeout: GracefulTimeout,
 	}
+	s.vhosts.fallbackHosts = append(s.vhosts.fallbackHosts, getFallbacks(group)...)
 	s.Server = makeHTTPServerWithHeaderLimit(s.Server, group)
 	s.Server.Handler = s // this is weird, but whatever
 
@@ -77,14 +88,14 @@ func NewServer(addr string, group []*SiteConfig) (*Server, error) {
 	}
 	s.Server.TLSConfig = tlsConfig
 
-	// Enable QUIC if desired
-	if QUIC {
-		s.quicServer = &h2quic.Server{Server: s.Server}
-		s.Server.Handler = s.wrapWithSvcHeaders(s.Server.Handler)
-	}
-
 	// if TLS is enabled, make sure we prepare the Server accordingly
 	if s.Server.TLSConfig != nil {
+		// enable QUIC if desired (requires HTTP/2)
+		if HTTP2 && QUIC {
+			s.quicServer = &h2quic.Server{Server: s.Server}
+			s.Server.Handler = s.wrapWithSvcHeaders(s.Server.Handler)
+		}
+
 		// wrap the HTTP handler with a handler that does MITM detection
 		tlsh := &tlsHandler{next: s.Server.Handler}
 		s.Server.Handler = tlsh // this needs to be the "outer" handler when Serve() is called, for type assertion
@@ -302,7 +313,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // ServePacket serves QUIC requests on pc until it is closed.
 func (s *Server) ServePacket(pc net.PacketConn) error {
-	if QUIC {
+	if s.quicServer != nil {
 		err := s.quicServer.Serve(pc.(*net.UDPConn))
 		return fmt.Errorf("serving QUIC connections: %v", err)
 	}
@@ -366,7 +377,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 		if err != nil {
 			remoteHost = r.RemoteAddr
 		}
-		WriteTextResponse(w, http.StatusNotFound, "No such site at "+s.Server.Addr)
+		WriteSiteNotFound(w, r) // don't add headers outside of this function
 		log.Printf("[INFO] %s - No such site at %s (Remote: %s, Referer: %s)",
 			hostname, s.Server.Addr, remoteHost, r.Header.Get("Referer"))
 		return 0, nil
@@ -450,9 +461,9 @@ func (s *Server) OnStartupComplete() {
 }
 
 // defaultTimeouts stores the default timeout values to use
-// if left unset by user configuration. NOTE: Default timeouts
-// are disabled (see issue #1464).
-var defaultTimeouts Timeouts
+// if left unset by user configuration. NOTE: Most default
+// timeouts are disabled (see issues #1464 and #1733).
+var defaultTimeouts = Timeouts{IdleTimeout: 5 * time.Minute}
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
 // connections. It's used by ListenAndServe and ListenAndServeTLS so
@@ -488,6 +499,19 @@ var ErrMaxBytesExceeded = errors.New("http: request body too large")
 // of the specified HTTP status code.
 func DefaultErrorFunc(w http.ResponseWriter, r *http.Request, status int) {
 	WriteTextResponse(w, status, fmt.Sprintf("%d %s\n", status, http.StatusText(status)))
+}
+
+const httpStatusMisdirectedRequest = 421 // RFC 7540, 9.1.2
+
+// WriteSiteNotFound writes appropriate error code to w, signaling that
+// requested host is not served by Caddy on a given port.
+func WriteSiteNotFound(w http.ResponseWriter, r *http.Request) {
+	status := http.StatusNotFound
+	if r.ProtoMajor >= 2 {
+		// TODO: use http.StatusMisdirectedRequest when it gets defined
+		status = httpStatusMisdirectedRequest
+	}
+	WriteTextResponse(w, status, fmt.Sprintf("%d Site %s is not served on this interface\n", status, r.Host))
 }
 
 // WriteTextResponse writes body with code status to w. The body will

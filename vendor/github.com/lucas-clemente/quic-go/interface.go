@@ -1,7 +1,6 @@
 package quic
 
 import (
-	"crypto/tls"
 	"io"
 	"net"
 	"time"
@@ -11,12 +10,32 @@ import (
 
 // Stream is the interface implemented by QUIC streams
 type Stream interface {
+	// Read reads data from the stream.
+	// Read can be made to time out and return a net.Error with Timeout() == true
+	// after a fixed time limit; see SetDeadline and SetReadDeadline.
 	io.Reader
+	// Write writes data to the stream.
+	// Write can be made to time out and return a net.Error with Timeout() == true
+	// after a fixed time limit; see SetDeadline and SetWriteDeadline.
 	io.Writer
 	io.Closer
 	StreamID() protocol.StreamID
 	// Reset closes the stream with an error.
 	Reset(error)
+	// SetReadDeadline sets the deadline for future Read calls and
+	// any currently-blocked Read call.
+	// A zero value for t means Read will not time out.
+	SetReadDeadline(t time.Time) error
+	// SetWriteDeadline sets the deadline for future Write calls
+	// and any currently-blocked Write call.
+	// Even if write times out, it may return n > 0, indicating that
+	// some of the data was successfully written.
+	// A zero value for t means Write will not time out.
+	SetWriteDeadline(t time.Time) error
+	// SetDeadline sets the read and write deadlines associated
+	// with the connection. It is equivalent to calling both
+	// SetReadDeadline and SetWriteDeadline.
+	SetDeadline(t time.Time) error
 }
 
 // A Session is a QUIC connection between two peers.
@@ -64,7 +83,6 @@ type STK struct {
 // Config contains all configuration data needed for a QUIC server or client.
 // More config parameters (such as timeouts) will be added soon, see e.g. https://github.com/lucas-clemente/quic-go/issues/441.
 type Config struct {
-	TLSConfig *tls.Config
 	// The QUIC versions that can be negotiated.
 	// If not set, it uses all versions available.
 	// Warning: This API should not be considered stable and will change soon.
@@ -88,6 +106,8 @@ type Config struct {
 	// MaxReceiveConnectionFlowControlWindow is the connection-level flow control window for receiving data.
 	// If this value is zero, it will default to 1.5 MB for the server and 15 MB for the client.
 	MaxReceiveConnectionFlowControlWindow protocol.ByteCount
+	// KeepAlive defines whether this peer will periodically send PING frames to keep the connection alive.
+	KeepAlive bool
 }
 
 // A Listener for incoming QUIC connections
