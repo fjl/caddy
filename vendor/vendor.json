@@ -537,6 +537,12 @@
 			"revisionTime": "2017-07-19T22:54:35Z"
 		},
 		{
+			"checksumSHA1": "jignaIEM3RkWEzmOvC6lDgrwqug=",
+			"path": "github.com/zikes/gopkg",
+			"revision": "d69f9db7508aad543479147c24c70df9dc2ec997",
+			"revisionTime": "2017-06-29T20:31:09Z"
+		},
+		{
 			"checksumSHA1": "MlEHIE/60sB86Lmf0MPTIXHzKzE=",
 			"path": "golang.org/x/crypto/curve25519",
 			"revision": "558b6879de74bc843225cde5686419267ff707ca",
