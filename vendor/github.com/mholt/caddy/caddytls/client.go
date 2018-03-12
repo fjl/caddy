@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddytls
 
 import (
@@ -25,6 +39,7 @@ type ACMEClient struct {
 	AllowPrompts bool
 	config       *Config
 	acmeClient   *acme.Client
+	storage      Storage
 }
 
 // newACMEClient creates a new ACMEClient given an email and whether
@@ -106,6 +121,7 @@ var newACMEClient = func(config *Config, allowPrompts bool) (*ACMEClient, error)
 		AllowPrompts: allowPrompts,
 		config:       config,
 		acmeClient:   client,
+		storage:      storage,
 	}
 
 	if config.DNSProvider == "" {
@@ -141,7 +157,7 @@ var newACMEClient = func(config *Config, allowPrompts bool) (*ACMEClient, error)
 
 		// See if TLS challenge needs to be handled by our own facilities
 		if caddy.HasListenerWithAddress(net.JoinHostPort(config.ListenHost, useTLSSNIPort)) {
-			c.acmeClient.SetChallengeProvider(acme.TLSSNI01, tlsSniSolver{})
+			c.acmeClient.SetChallengeProvider(acme.TLSSNI01, tlsSNISolver{certCache: config.certCache})
 		}
 
 		// Disable any challenges that should not be used
@@ -190,13 +206,7 @@ var newACMEClient = func(config *Config, allowPrompts bool) (*ACMEClient, error)
 // Callers who have access to a Config value should use the ObtainCert
 // method on that instead of this lower-level method.
 func (c *ACMEClient) Obtain(name string) error {
-	// Get access to ACME storage
-	storage, err := c.config.StorageFor(c.config.CAUrl)
-	if err != nil {
-		return err
-	}
-
-	waiter, err := storage.TryLock(name)
+	waiter, err := c.storage.TryLock(name)
 	if err != nil {
 		return err
 	}
@@ -206,7 +216,7 @@ func (c *ACMEClient) Obtain(name string) error {
 		return nil // we assume the process with the lock succeeded, rather than hammering this execution path again
 	}
 	defer func() {
-		if err := storage.Unlock(name); err != nil {
+		if err := c.storage.Unlock(name); err != nil {
 			log.Printf("[ERROR] Unable to unlock obtain call for %s: %v", name, err)
 		}
 	}()
@@ -249,7 +259,7 @@ Attempts:
 		}
 
 		// Success - immediately save the certificate resource
-		err = saveCertResource(storage, certificate)
+		err = saveCertResource(c.storage, certificate)
 		if err != nil {
 			return fmt.Errorf("error saving assets for %v: %v", name, err)
 		}
@@ -260,35 +270,30 @@ Attempts:
 	return nil
 }
 
-// Renew renews the managed certificate for name. This function is
-// safe for concurrent use.
+// Renew renews the managed certificate for name. It puts the renewed
+// certificate into storage (not the cache). This function is safe for
+// concurrent use.
 //
 // Callers who have access to a Config value should use the RenewCert
 // method on that instead of this lower-level method.
 func (c *ACMEClient) Renew(name string) error {
-	// Get access to ACME storage
-	storage, err := c.config.StorageFor(c.config.CAUrl)
-	if err != nil {
-		return err
-	}
-
-	waiter, err := storage.TryLock(name)
+	waiter, err := c.storage.TryLock(name)
 	if err != nil {
 		return err
 	}
 	if waiter != nil {
 		log.Printf("[INFO] Certificate for %s is already being renewed elsewhere and stored; waiting", name)
 		waiter.Wait()
-		return nil // we assume the process with the lock succeeded, rather than hammering this execution path again
+		return nil // assume that the worker that renewed the cert succeeded; avoid hammering this path over and over
 	}
 	defer func() {
-		if err := storage.Unlock(name); err != nil {
+		if err := c.storage.Unlock(name); err != nil {
 			log.Printf("[ERROR] Unable to unlock renew call for %s: %v", name, err)
 		}
 	}()
 
 	// Prepare for renewal (load PEM cert, key, and meta)
-	siteData, err := storage.LoadSite(name)
+	siteData, err := c.storage.LoadSite(name)
 	if err != nil {
 		return err
 	}
@@ -331,18 +336,15 @@ func (c *ACMEClient) Renew(name string) error {
 		return errors.New("too many renewal attempts; last error: " + err.Error())
 	}
 
-	return saveCertResource(storage, newCertMeta)
+	caddy.EmitEvent(caddy.CertRenewEvent, name)
+
+	return saveCertResource(c.storage, newCertMeta)
 }
 
-// Revoke revokes the certificate for name and deltes
+// Revoke revokes the certificate for name and deletes
 // it from storage.
 func (c *ACMEClient) Revoke(name string) error {
-	storage, err := c.config.StorageFor(c.config.CAUrl)
-	if err != nil {
-		return err
-	}
-
-	siteExists, err := storage.SiteExists(name)
+	siteExists, err := c.storage.SiteExists(name)
 	if err != nil {
 		return err
 	}
@@ -351,7 +353,7 @@ func (c *ACMEClient) Revoke(name string) error {
 		return errors.New("no certificate and key for " + name)
 	}
 
-	siteData, err := storage.LoadSite(name)
+	siteData, err := c.storage.LoadSite(name)
 	if err != nil {
 		return err
 	}
@@ -361,7 +363,7 @@ func (c *ACMEClient) Revoke(name string) error {
 		return err
 	}
 
-	err = storage.DeleteSite(name)
+	err = c.storage.DeleteSite(name)
 	if err != nil {
 		return errors.New("certificate revoked, but unable to delete certificate file: " + err.Error())
 	}

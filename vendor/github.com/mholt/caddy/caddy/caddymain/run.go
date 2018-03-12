@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddymain
 
 import (
@@ -83,7 +97,7 @@ func Run() {
 		os.Exit(0)
 	}
 	if version {
-		fmt.Printf("%s %s\n", appName, appVersion)
+		fmt.Printf("%s %s (unofficial)\n", appName, appVersion)
 		if devBuild && gitShortStat != "" {
 			fmt.Printf("%s\n%s\n", gitShortStat, gitFilesModified)
 		}
@@ -126,6 +140,9 @@ func Run() {
 		mustLogFatalf("%v", err)
 	}
 
+	// Execute instantiation events
+	caddy.EmitEvent(caddy.InstanceStartupEvent, instance)
+
 	// Twiddle your thumbs
 	instance.Wait()
 }
@@ -153,10 +170,18 @@ func confLoader(serverType string) (caddy.Input, error) {
 		return caddy.CaddyfileFromPipe(os.Stdin, serverType)
 	}
 
-	contents, err := ioutil.ReadFile(conf)
-	if err != nil {
-		return nil, err
+	var contents []byte
+	if strings.Contains(conf, "*") {
+		// Let caddyfile.doImport logic handle the globbed path
+		contents = []byte("import " + conf)
+	} else {
+		var err error
+		contents, err = ioutil.ReadFile(conf)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	return caddy.CaddyfileInput{
 		Contents:       contents,
 		Filepath:       conf,
@@ -186,10 +211,14 @@ func setVersion() {
 	// A development build is one that's not at a tag or has uncommitted changes
 	devBuild = gitTag == "" || gitShortStat != ""
 
+	if buildDate != "" {
+		buildDate = " " + buildDate
+	}
+
 	// Only set the appVersion if -ldflags was used
 	if gitNearestTag != "" || gitTag != "" {
 		if devBuild && gitNearestTag != "" {
-			appVersion = fmt.Sprintf("%s (+%s %s)",
+			appVersion = fmt.Sprintf("%s (+%s%s)",
 				strings.TrimPrefix(gitNearestTag, "v"), gitCommit, buildDate)
 		} else if gitTag != "" {
 			appVersion = strings.TrimPrefix(gitTag, "v")
@@ -200,6 +229,8 @@ func setVersion() {
 // setCPU parses string cpu and sets GOMAXPROCS
 // according to its value. It accepts either
 // a number (e.g. 3) or a percent (e.g. 50%).
+// If the percent resolves to less than a single
+// GOMAXPROCS, it rounds it up to GOMAXPROCS=1.
 func setCPU(cpu string) error {
 	var numCPU int
 
@@ -215,6 +246,9 @@ func setCPU(cpu string) error {
 		}
 		percent = float32(pctInt) / 100
 		numCPU = int(float32(availCPU) * percent)
+		if numCPU < 1 {
+			numCPU = 1
+		}
 	} else {
 		// Number
 		num, err := strconv.Atoi(cpu)

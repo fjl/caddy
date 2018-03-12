@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package httpserver implements an HTTP server on top of Caddy.
 package httpserver
 
@@ -128,7 +142,7 @@ func NewServer(addr string, group []*SiteConfig) (*Server, error) {
 
 	// Compile custom middleware for every site (enables virtual hosting)
 	for _, site := range group {
-		stack := Handler(staticfiles.FileServer{Root: http.Dir(site.Root), Hide: site.HiddenFiles})
+		stack := Handler(staticfiles.FileServer{Root: http.Dir(site.Root), Hide: site.HiddenFiles, IndexPages: site.IndexPages})
 		for i := len(site.middleware) - 1; i >= 0; i-- {
 			stack = site.middleware[i](stack)
 		}
@@ -342,6 +356,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c := context.WithValue(r.Context(), OriginalURLCtxKey, urlCopy)
 	r = r.WithContext(c)
 
+	// Setup a replacer for the request that keeps track of placeholder
+	// values across plugins.
+	replacer := NewReplacer(r, nil, "")
+	c = context.WithValue(r.Context(), ReplacerCtxKey, replacer)
+	r = r.WithContext(c)
+
 	w.Header().Set("Server", caddy.AppName)
 
 	status, _ := s.serveHTTP(w, r)
@@ -369,7 +389,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 	if vhost == nil {
 		// check for ACME challenge even if vhost is nil;
 		// could be a new host coming online soon
-		if caddytls.HTTPChallengeHandler(w, r, "localhost", caddytls.DefaultHTTPAlternatePort) {
+		if caddytls.HTTPChallengeHandler(w, r, "localhost") {
 			return 0, nil
 		}
 		// otherwise, log the error and write a message to the client
@@ -385,7 +405,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 
 	// we still check for ACME challenge if the vhost exists,
 	// because we must apply its HTTP challenge config settings
-	if s.proxyHTTPChallenge(vhost, w, r) {
+	if caddytls.HTTPChallengeHandler(w, r, vhost.ListenHost) {
 		return 0, nil
 	}
 
@@ -393,31 +413,25 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 	// the URL path, so a request to example.com/foo/blog on the site
 	// defined as example.com/foo appears as /blog instead of /foo/blog.
 	if pathPrefix != "/" {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, pathPrefix)
-		if !strings.HasPrefix(r.URL.Path, "/") {
-			r.URL.Path = "/" + r.URL.Path
-		}
+		r.URL = trimPathPrefix(r.URL, pathPrefix)
 	}
 
 	return vhost.middlewareChain.ServeHTTP(w, r)
 }
 
-// proxyHTTPChallenge solves the ACME HTTP challenge if r is the HTTP
-// request for the challenge. If it is, and if the request has been
-// fulfilled (response written), true is returned; false otherwise.
-// If you don't have a vhost, just call the challenge handler directly.
-func (s *Server) proxyHTTPChallenge(vhost *SiteConfig, w http.ResponseWriter, r *http.Request) bool {
-	if vhost.Addr.Port != caddytls.HTTPChallengePort {
-		return false
+func trimPathPrefix(u *url.URL, prefix string) *url.URL {
+	// We need to use URL.EscapedPath() when trimming the pathPrefix as
+	// URL.Path is ambiguous about / or %2f - see docs. See #1927
+	trimmed := strings.TrimPrefix(u.EscapedPath(), prefix)
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
 	}
-	if vhost.TLS != nil && vhost.TLS.Manual {
-		return false
+	trimmedURL, err := url.Parse(trimmed)
+	if err != nil {
+		log.Printf("[ERROR] Unable to parse trimmed URL %s: %v", trimmed, err)
+		return u
 	}
-	altPort := caddytls.DefaultHTTPAlternatePort
-	if vhost.TLS != nil && vhost.TLS.AltHTTPPort != "" {
-		altPort = vhost.TLS.AltHTTPPort
-	}
-	return caddytls.HTTPChallengeHandler(w, r, vhost.ListenHost, altPort)
+	return trimmedURL
 }
 
 // Address returns the address s was assigned to listen on.

@@ -13,8 +13,8 @@ import (
 	"golang.org/x/net/lex/httplex"
 
 	quic "github.com/lucas-clemente/quic-go"
+	"github.com/lucas-clemente/quic-go/internal/protocol"
 	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/protocol"
 )
 
 type requestWriter struct {
@@ -76,9 +76,8 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 			if !validPseudoPath(path) {
 				if req.URL.Opaque != "" {
 					return nil, fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
-				} else {
-					return nil, fmt.Errorf("invalid request :path %q", orig)
 				}
+				return nil, fmt.Errorf("invalid request :path %q", orig)
 			}
 		}
 	}

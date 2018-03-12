@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package browse
 
 import (
@@ -64,8 +78,9 @@ func browseParse(c *caddy.Controller) ([]Config, error) {
 		}
 
 		bc.Fs = staticfiles.FileServer{
-			Root: http.Dir(cfg.Root),
-			Hide: cfg.HiddenFiles,
+			Root:       http.Dir(cfg.Root),
+			Hide:       cfg.HiddenFiles,
+			IndexPages: cfg.IndexPages,
 		}
 
 		// Second argument would be the template file to use
@@ -222,11 +237,16 @@ th svg {
 }
 
 td {
+	white-space: nowrap;
 	font-size: 14px;
 }
 
 td:first-child {
-	width: 50%;
+	width: 100%;
+}
+
+td:nth-child(2) {
+	padding: 0 20px 0 20px;
 }
 
 th:last-child,
@@ -479,7 +499,7 @@ footer {
 						return;
 					}
 				}
-				e.textContent = d.toLocaleString();
+				e.textContent = d.toLocaleString([], {day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"});
 			}
 			var timeList = Array.prototype.slice.call(document.getElementsByTagName("time"));
 			timeList.forEach(localizeDatetime);

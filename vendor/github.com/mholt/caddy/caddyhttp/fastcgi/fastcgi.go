@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package fastcgi has middleware that acts as a FastCGI client. Requests
 // that get forwarded to FastCGI stop the middleware execution chain.
 // The most common use for this package is to serve PHP websites via php-fpm.
@@ -6,6 +20,7 @@ package fastcgi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 )
 
@@ -92,7 +108,11 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 			}
 
 			// Connect to FastCGI gateway
-			network, address := parseAddress(rule.Address())
+			address, err := rule.Address()
+			if err != nil {
+				return http.StatusBadGateway, err
+			}
+			network, address := parseAddress(address)
 
 			ctx := context.Background()
 			if rule.ConnectTimeout > 0 {
@@ -128,7 +148,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 			case "HEAD":
 				resp, err = fcgiBackend.Head(env)
 			case "GET":
-				resp, err = fcgiBackend.Get(env)
+				resp, err = fcgiBackend.Get(env, r.Body, contentLength)
 			case "OPTIONS":
 				resp, err = fcgiBackend.Options(env)
 			default:
@@ -248,6 +268,11 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 	// Strip PATH_INFO from SCRIPT_NAME
 	scriptName = strings.TrimSuffix(scriptName, pathInfo)
 
+	// Add vhost path prefix to scriptName. Otherwise, some PHP software will
+	// have difficulty discovering its URL.
+	pathPrefix, _ := r.Context().Value(caddy.CtxKey("path_prefix")).(string)
+	scriptName = path.Join(pathPrefix, scriptName)
+
 	// Get the request URI from context. The context stores the original URI in case
 	// it was changed by a middleware such as rewrite. By default, we pass the
 	// original URI in as the value of REQUEST_URI (the user can overwrite this
@@ -361,7 +386,7 @@ type Rule struct {
 type balancer interface {
 	// Address picks an upstream address from the
 	// underlying load balancer.
-	Address() string
+	Address() (string, error)
 }
 
 // roundRobin is a round robin balancer for fastcgi upstreams.
@@ -373,9 +398,34 @@ type roundRobin struct {
 	addresses []string
 }
 
-func (r *roundRobin) Address() string {
+func (r *roundRobin) Address() (string, error) {
 	index := atomic.AddInt64(&r.index, 1) % int64(len(r.addresses))
-	return r.addresses[index]
+	return r.addresses[index], nil
+}
+
+// srvResolver is a private interface used to abstract
+// the DNS resolver. It is mainly used to facilitate testing.
+type srvResolver interface {
+	LookupSRV(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
+}
+
+// srv is a service locator for fastcgi upstreams
+type srv struct {
+	resolver srvResolver
+	service  string
+}
+
+// Address looks up the service and returns the address:port
+// from first result in resolved list.
+// No explicit balancing is required because net.LookupSRV
+// sorts the results by priority and randomizes within priority.
+func (s *srv) Address() (string, error) {
+	_, addrs, err := s.resolver.LookupSRV(context.Background(), "", "", s.service)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%s:%d", strings.TrimRight(addrs[0].Target, "."), addrs[0].Port), nil
 }
 
 // canSplit checks if path can split into two based on rule.SplitPath.

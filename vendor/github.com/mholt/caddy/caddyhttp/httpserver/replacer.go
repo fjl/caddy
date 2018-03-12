@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
@@ -88,20 +102,30 @@ func (lw *limitWriter) String() string {
 // emptyValue should be the string that is used in place
 // of empty string (can still be empty string).
 func NewReplacer(r *http.Request, rr *ResponseRecorder, emptyValue string) Replacer {
-	rb := newLimitWriter(MaxLogBodySize)
-	if r.Body != nil {
-		r.Body = struct {
-			io.Reader
-			io.Closer
-		}{io.TeeReader(r.Body, rb), io.Closer(r.Body)}
+	repl := &replacer{
+		request:          r,
+		responseRecorder: rr,
+		emptyValue:       emptyValue,
 	}
-	return &replacer{
-		request:            r,
-		requestBody:        rb,
-		responseRecorder:   rr,
-		customReplacements: make(map[string]string),
-		emptyValue:         emptyValue,
+
+	// extract customReplacements from a request replacer when present.
+	if existing, ok := r.Context().Value(ReplacerCtxKey).(*replacer); ok {
+		repl.requestBody = existing.requestBody
+		repl.customReplacements = existing.customReplacements
+	} else {
+		// if there is no existing replacer, build one from scratch.
+		rb := newLimitWriter(MaxLogBodySize)
+		if r.Body != nil {
+			r.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.TeeReader(r.Body, rb), io.Closer(r.Body)}
+		}
+		repl.requestBody = rb
+		repl.customReplacements = make(map[string]string)
 	}
+
+	return repl
 }
 
 func canLogRequest(r *http.Request) bool {
@@ -194,6 +218,16 @@ func (r *replacer) getSubstitution(key string) string {
 	if key[1] == '>' {
 		want := key[2 : len(key)-1]
 		for key, values := range r.request.Header {
+			// Header placeholders (case-insensitive)
+			if strings.EqualFold(key, want) {
+				return strings.Join(values, ",")
+			}
+		}
+	}
+	// search response headers then
+	if r.responseRecorder != nil && key[1] == '<' {
+		want := key[2 : len(key)-1]
+		for key, values := range r.responseRecorder.Header() {
 			// Header placeholders (case-insensitive)
 			if strings.EqualFold(key, want) {
 				return strings.Join(values, ",")

@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Forked Jan. 2015 from http://bitbucket.org/PinIdea/fcgi_client
 // (which is forked from https://code.google.com/p/go-fastcgi-client/)
 
@@ -446,12 +460,12 @@ func (c *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.Res
 }
 
 // Get issues a GET request to the fcgi responder.
-func (c *FCGIClient) Get(p map[string]string) (resp *http.Response, err error) {
+func (c *FCGIClient) Get(p map[string]string, body io.Reader, l int64) (resp *http.Response, err error) {
 
 	p["REQUEST_METHOD"] = "GET"
-	p["CONTENT_LENGTH"] = "0"
+	p["CONTENT_LENGTH"] = strconv.FormatInt(l, 10)
 
-	return c.Request(p, nil)
+	return c.Request(p, body)
 }
 
 // Head issues a HEAD request to the fcgi responder.
