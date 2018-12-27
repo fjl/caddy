@@ -10,5 +10,6 @@ import (
 )
 
 func main() {
+	caddymain.EnableTelemetry = false
 	caddymain.Run()
 }
