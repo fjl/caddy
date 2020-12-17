@@ -1,14 +1,14 @@
 package main
 
 import (
-	"github.com/caddyserver/caddy/caddy/caddymain"
+	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 
-	// Register Extensions
-	_ "github.com/abiosoft/caddy-git"
-	_ "github.com/hacdias/caddy-minify"
+	// Register extensions
+	_ "github.com/abiosoft/caddy-exec"
+	_ "github.com/abiosoft/caddy-hmac"
+	_ "github.com/caddyserver/caddy/v2/modules/standard"
 )
 
 func main() {
-	caddymain.EnableTelemetry = false
-	caddymain.Run()
+	caddycmd.Main()
 }
