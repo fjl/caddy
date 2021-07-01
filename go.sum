@@ -104,6 +104,8 @@ github.com/abiosoft/caddy-exec v0.0.0-20210526181020-06d4f7218eb8 h1:y8/+QrHKMMl
 github.com/abiosoft/caddy-exec v0.0.0-20210526181020-06d4f7218eb8/go.mod h1:bv4OhmIJ+/QFkX4rOn/rvg2I8J0bhxcf0xgXoFPpzTQ=
 github.com/abiosoft/caddy-hmac v0.0.0-20200528051232-71b2c4bbf374 h1:i6ph00ox/ZHt/+DI7Mg+rGx0isMzuHvl91FvM+afQ6c=
 github.com/abiosoft/caddy-hmac v0.0.0-20200528051232-71b2c4bbf374/go.mod h1:NtBWw68YRpvP3c0jeC+0M+mYUgCtaFPnjrNWlDG2M5Q=
+github.com/abiosoft/caddy-hmac v0.0.0-20210522205451-976ca0a419ef h1:NOX6YpNCeYD0ZckQZj6Nz9KBjs9UM6EigRV6uAtX7Xc=
+github.com/abiosoft/caddy-hmac v0.0.0-20210522205451-976ca0a419ef/go.mod h1:KvRdiv61Njyyq5w4VXjviT2ZRZLb9GtusLw+ZF8AjV0=
 github.com/afex/hystrix-go v0.0.0-20180502004556-fa1af6a1f4f5/go.mod h1:SkGFH1ia65gfNATL8TAiHDNxPzPdmEL5uirI2Uyuz6c=
 github.com/akamai/AkamaiOPEN-edgegrid-golang v0.9.0/go.mod h1:zpDJeKyp9ScW4NNrbdr+Eyxvry3ilGPewKoXw3XGN1k=
 github.com/akamai/AkamaiOPEN-edgegrid-golang v0.9.8/go.mod h1:aVvklgKsPENRkl29bNwrHISa1F+YLGTHArMxZMBqWM8=
